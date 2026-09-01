@@ -1,0 +1,12 @@
+python -m pip install https://github.com/ultralytics/assets/releases/download/v0.0.0/torch-2.10.0-cp310-cp310-linux_aarch64.whl
+python -m pip install https://github.com/ultralytics/assets/releases/download/v0.0.0/torchvision-0.25.0-cp310-cp310-linux_aarch64.whl
+
+deactivate
+rm -rf .venv
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+
+python -m pip uninstall -y torch torchvision
+
+yolo export model=yolo26n.pt format=engine device=0 imgsz=640 batch=1 workspace=1 quantize=16
+

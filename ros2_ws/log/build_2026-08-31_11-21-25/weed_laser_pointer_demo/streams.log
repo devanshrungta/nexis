@@ -1,0 +1,19 @@
+[1.809s] Invoking command in '/home/sunoj-orin/devansh/ros2_ws/build/weed_laser_pointer_demo': PYTHONPATH=/home/sunoj-orin/devansh/ros2_ws/build/weed_laser_pointer_demo/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/sunoj-orin/devansh/ros2_ws/install/weed_laser_pointer_demo/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/sunoj-orin/devansh/ros2_ws/build/weed_laser_pointer_demo/build --no-deps symlink_data --force
+[2.326s] running develop
+[2.650s] running egg_info
+[2.650s] writing weed_laser_pointer_demo.egg-info/PKG-INFO
+[2.651s] writing dependency_links to weed_laser_pointer_demo.egg-info/dependency_links.txt
+[2.651s] writing entry points to weed_laser_pointer_demo.egg-info/entry_points.txt
+[2.651s] writing requirements to weed_laser_pointer_demo.egg-info/requires.txt
+[2.652s] writing top-level names to weed_laser_pointer_demo.egg-info/top_level.txt
+[2.656s] reading manifest file 'weed_laser_pointer_demo.egg-info/SOURCES.txt'
+[2.657s] writing manifest file 'weed_laser_pointer_demo.egg-info/SOURCES.txt'
+[2.659s] running build_ext
+[2.660s] Creating /home/sunoj-orin/devansh/ros2_ws/install/weed_laser_pointer_demo/lib/python3.10/site-packages/weed-laser-pointer-demo.egg-link (link to .)
+[2.661s] Installing test_node script to /home/sunoj-orin/devansh/ros2_ws/install/weed_laser_pointer_demo/lib/weed_laser_pointer_demo
+[2.662s] 
+[2.662s] Installed /home/sunoj-orin/devansh/ros2_ws/build/weed_laser_pointer_demo
+[2.662s] running symlink_data
+[2.662s] symbolically linking /home/sunoj-orin/devansh/ros2_ws/build/weed_laser_pointer_demo/resource/weed_laser_pointer_demo -> /home/sunoj-orin/devansh/ros2_ws/install/weed_laser_pointer_demo/share/ament_index/resource_index/packages
+[2.662s] symbolically linking /home/sunoj-orin/devansh/ros2_ws/build/weed_laser_pointer_demo/package.xml -> /home/sunoj-orin/devansh/ros2_ws/install/weed_laser_pointer_demo/share/weed_laser_pointer_demo
+[2.744s] Invoked command in '/home/sunoj-orin/devansh/ros2_ws/build/weed_laser_pointer_demo' returned '0': PYTHONPATH=/home/sunoj-orin/devansh/ros2_ws/build/weed_laser_pointer_demo/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/sunoj-orin/devansh/ros2_ws/install/weed_laser_pointer_demo/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/sunoj-orin/devansh/ros2_ws/build/weed_laser_pointer_demo/build --no-deps symlink_data --force
