@@ -5,6 +5,8 @@ import numpy as np
 import time
 import os
 import csv
+import math
+import random
 from datetime import datetime
 
 
@@ -44,9 +46,6 @@ NEUTRAL_PULSE_US = 1500
 
 # ============================================================
 # LASER DETECTION
-#
-# THESE VALUES ARE COPIED EXACTLY FROM YOUR
-# laser_detection.py
 # ============================================================
 
 BRIGHTNESS_MIN = 220
@@ -56,28 +55,94 @@ MORPH_KERNEL_SIZE = 3
 
 MIN_BLOB_AREA = 4
 
+# --------------------------------------------------------
+# NEW: detection continuity gating
+#
+# Prevents the detector from "flipping" between two
+# real bright blobs (e.g. the laser dot and a reflection)
+# frame to frame, which was the actual cause of the
+# oscillation seen in the CSV log — not a gain problem.
+# --------------------------------------------------------
+
+MAX_JUMP_PX = 150
+# Largest frame-to-frame centroid movement (px) that is
+# accepted as "the same blob." A candidate blob farther
+# than this from the last accepted position is treated as
+# a false detection for that frame and ignored.
+# Too low  -> genuine fast laser motion gets rejected.
+# Too high -> lets the reflection-jump problem back in.
+
+REACQUIRE_TIMEOUT = 1.0
+# If no candidate has been accepted for this many seconds
+# (e.g. the real laser was genuinely occluded/moved far),
+# gating is dropped for one frame so tracking can recover
+# instead of staying locked onto a stale position forever.
+
 
 # ============================================================
 # CONTROL
 # ============================================================
 
-# Start conservative.
-#
-# This is NOT a detection parameter.
-# It controls how aggressively the servo responds
-# to pixel error.
-
-PIXEL_TO_US = 0.02
-
-MAX_STEP_US = 10
-
 PIXEL_DEADBAND = 15
 
-SERVO_SETTLE_TIME = 0.3
+SERVO_UPDATE_INTERVAL = 0.10
+
+ALPHA = 0.4
+# EMA smoothing factor on the laser x position used for
+# error calculation. Lower = smoother but laggier.
+
+# --------------------------------------------------------
+# NEW: Adam-style adaptive step
+#
+# Replaces the flat PIXEL_TO_US proportional gain. See the
+# accompanying markdown for what each of these does — in
+# short: ADAM_LR is the base gain, BETA1/BETA2 control how
+# much recent error history smooths the step (this is what
+# resists single-frame noise/jump spikes), and EASE_DISTANCE_PX
+# is what actually forces smaller steps near the target.
+# --------------------------------------------------------
+
+ADAM_LR = 8
+ADAM_BETA1 = 0.9
+ADAM_BETA2 = 0.999
+ADAM_EPS = 1e-3
+
+EASE_DISTANCE_PX = 150
+# Distance (px) at which step size starts scaling down.
+# At |error| >= this value: full step. At |error| == 0:
+# step scaled to 0. Linear ramp in between.
+
+MAX_STEP_US = 10
+# Hard safety cap on any single correction, regardless of
+# what Adam/easing compute.
+
+
+# --------------------------------------------------------
+# NEW: post-target jitter
+#
+# After the target is reached, deliberately wiggles the
+# pulse around the settled position for a short time.
+# --------------------------------------------------------
+
+JITTER_ENABLE = True
+
+JITTER_AMPLITUDE_US = 5.0
+# How far (in us) the jitter swings from the settled pulse.
+# Larger = more visible/aggressive wiggle.
+
+JITTER_DURATION_S = 3.0
+# How long (seconds) to jitter after reaching target.
+
+JITTER_FREQUENCY_HZ = 3.0
+# Speed of the sinusoidal component of the jitter.
+
+JITTER_RANDOMNESS = 0.3
+# Blend between smooth sine motion (0.0) and pure random
+# noise (1.0). e.g. 0.3 = mostly smooth with some noise.
 
 
 # ============================================================
-# LOGGING
+# LOGGING (unchanged — original log/video files)
 # ============================================================
 
 LOG_DIR = "servo_logs"
@@ -96,10 +161,6 @@ LOG_FILE = os.path.join(
     f"laser_servo_{timestamp}.csv"
 )
 
-# ============================================================
-# VIDEO RECORDING (combined: main output + mask side-by-side)
-# ============================================================
-
 VIDEO_FILE = os.path.join(
     LOG_DIR,
     f"laser_servo_{timestamp}.mp4"
@@ -107,13 +168,13 @@ VIDEO_FILE = os.path.join(
 
 video_writer = None
 
+
 def setup_video_writer(width, height, fps):
 
     global video_writer
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-    # Combined frame is output + mask placed side by side
     combined_width = width * 2
 
     video_writer = cv2.VideoWriter(
@@ -126,6 +187,149 @@ def setup_video_writer(width, height, fps):
     if not video_writer.isOpened():
         print(f"[VIDEO] Failed to open writer for {VIDEO_FILE}")
         video_writer = None
+
+
+log_file = None
+csv_writer = None
+
+
+def setup_logging():
+
+    global log_file
+    global csv_writer
+
+    log_file = open(
+        LOG_FILE,
+        "w",
+        newline=""
+    )
+
+    csv_writer = csv.writer(
+        log_file
+    )
+
+    csv_writer.writerow([
+        "timestamp",
+        "frame",
+        "target_x",
+        "target_y",
+        "laser_x",
+        "laser_y",
+        "error_x",
+        "pulse_us",
+        "blob_area",
+        "num_contours",
+        "tracking"
+    ])
+
+    log_file.flush()
+
+
+def log_data(
+    frame_number,
+    target_x,
+    target_y,
+    laser_x,
+    laser_y,
+    error_x,
+    pulse_us,
+    blob_area,
+    num_contours,
+    tracking
+):
+
+    if csv_writer is None:
+        return
+
+    csv_writer.writerow([
+        time.time(),
+        frame_number,
+        target_x,
+        target_y,
+        laser_x,
+        laser_y,
+        error_x,
+        pulse_us,
+        blob_area,
+        num_contours,
+        tracking
+    ])
+
+    log_file.flush()
+
+
+# ============================================================
+# NEW: separate diagnostic log
+#
+# Does not touch LOG_FILE/log_data above. Captures everything
+# needed to debug detection + control behavior from the CSV
+# alone, without needing the video or OCR.
+# ============================================================
+
+EXTRA_LOG_FILE = os.path.join(
+    LOG_DIR,
+    f"laser_servo_{timestamp}_extra.csv"
+)
+
+extra_log_file = None
+extra_csv_writer = None
+
+EXTRA_LOG_FIELDS = [
+    "timestamp",
+    "frame",
+    "status_text",
+    "target_state",
+    "raw_laser_x",
+    "raw_laser_y",
+    "filtered_x",
+    "num_candidates",
+    "jumped",
+    "jump_distance",
+    "detection_rejected",
+    "error_x",
+    "adam_m",
+    "adam_v",
+    "adam_step",
+    "ease_factor",
+    "correction_us",
+    "pulse_us",
+    "jitter_offset_us",
+]
+
+
+def setup_extra_logging():
+
+    global extra_log_file
+    global extra_csv_writer
+
+    extra_log_file = open(
+        EXTRA_LOG_FILE,
+        "w",
+        newline=""
+    )
+
+    extra_csv_writer = csv.writer(
+        extra_log_file
+    )
+
+    extra_csv_writer.writerow(EXTRA_LOG_FIELDS)
+
+    extra_log_file.flush()
+
+
+def log_extra_data(values):
+
+    if extra_csv_writer is None:
+        return
+
+    row = [time.time()] + [
+        values.get(field) for field in EXTRA_LOG_FIELDS[1:]
+    ]
+
+    extra_csv_writer.writerow(row)
+
+    extra_log_file.flush()
+
 
 # ============================================================
 # PWM
@@ -208,40 +412,24 @@ def stop_pwm():
 # ============================================================
 # LASER DETECTION
 #
-# EXACTLY MATCHES YOUR PROVIDED DETECTOR
+# NEW: returns ALL candidate blobs (not just the largest),
+# then selects the one closest to the last accepted position
+# instead of the largest one. Also reports whether the pick
+# was a suspicious jump.
 # ============================================================
 
-def detect_laser(frame):
-
-    # --------------------------------------------------------
-    # Convert to grayscale
-    # --------------------------------------------------------
+def detect_laser(frame, last_x=None, last_y=None):
 
     gray = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2GRAY
     )
 
-    # --------------------------------------------------------
-    # Find very bright pixels
-    #
-    # EXACT:
-    #     245 -> 255
-    # --------------------------------------------------------
-
     mask = cv2.inRange(
         gray,
         BRIGHTNESS_MIN,
         BRIGHTNESS_MAX
     )
-
-    # --------------------------------------------------------
-    # Remove tiny noise
-    #
-    # EXACT:
-    #     3x3 kernel
-    #     MORPH_OPEN
-    # --------------------------------------------------------
 
     kernel = np.ones(
         (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE),
@@ -254,142 +442,62 @@ def detect_laser(frame):
         kernel
     )
 
-    # --------------------------------------------------------
-    # Find contours
-    # --------------------------------------------------------
-
     contours, _ = cv2.findContours(
         mask,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE
     )
 
-    best = None
-    best_area = 0
+    candidates = []
 
     for contour in contours:
 
-        area = cv2.contourArea(
-            contour
-        )
-
-        # EXACT:
-        # Ignore regions below area 2
+        area = cv2.contourArea(contour)
 
         if area < MIN_BLOB_AREA:
             continue
 
-        if area > best_area:
+        M = cv2.moments(contour)
 
-            best = contour
-            best_area = area
+        if M["m00"] == 0:
+            continue
 
-    # --------------------------------------------------------
-    # No laser
-    # --------------------------------------------------------
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
 
-    if best is None:
+        candidates.append((cx, cy, area))
 
-        return None, None, 0, mask, len(contours)
+    num_candidates = len(candidates)
 
-    # --------------------------------------------------------
-    # Centroid
-    # --------------------------------------------------------
+    if num_candidates == 0:
+        return None, None, 0, mask, len(contours), 0, False, None
 
-    M = cv2.moments(best)
+    if last_x is None or last_y is None:
 
-    if M["m00"] == 0:
+        # No prior position to compare against yet —
+        # fall back to largest blob (original behavior)
+        # for initial acquisition only.
 
-        return None, None, 0, mask, len(contours)
+        cx, cy, area = max(candidates, key=lambda c: c[2])
 
-    cx = int(
-        M["m10"] / M["m00"]
-    )
+        return (
+            cx, cy, area, mask, len(contours),
+            num_candidates, False, None
+        )
 
-    cy = int(
-        M["m01"] / M["m00"]
-    )
+    def dist(c):
+        return math.hypot(c[0] - last_x, c[1] - last_y)
+
+    cx, cy, area = min(candidates, key=dist)
+
+    distance = dist((cx, cy, area))
+
+    jumped = distance > MAX_JUMP_PX
 
     return (
-        cx,
-        cy,
-        best_area,
-        mask,
-        len(contours)
+        cx, cy, area, mask, len(contours),
+        num_candidates, jumped, distance
     )
-
-
-# ============================================================
-# LOG FILE
-# ============================================================
-
-log_file = None
-csv_writer = None
-
-
-def setup_logging():
-
-    global log_file
-    global csv_writer
-
-    log_file = open(
-        LOG_FILE,
-        "w",
-        newline=""
-    )
-
-    csv_writer = csv.writer(
-        log_file
-    )
-
-    csv_writer.writerow([
-        "timestamp",
-        "frame",
-        "target_x",
-        "target_y",
-        "laser_x",
-        "laser_y",
-        "error_x",
-        "pulse_us",
-        "blob_area",
-        "num_contours",
-        "tracking"
-    ])
-
-    log_file.flush()
-
-
-def log_data(
-    frame_number,
-    target_x,
-    target_y,
-    laser_x,
-    laser_y,
-    error_x,
-    pulse_us,
-    blob_area,
-    num_contours,
-    tracking
-):
-
-    if csv_writer is None:
-        return
-
-    csv_writer.writerow([
-        time.time(),
-        frame_number,
-        target_x,
-        target_y,
-        laser_x,
-        laser_y,
-        error_x,
-        pulse_us,
-        blob_area,
-        num_contours,
-        tracking
-    ])
-
-    log_file.flush()
 
 
 # ============================================================
@@ -398,6 +506,8 @@ def log_data(
 
 target_x = None
 target_y = None
+target_state = "IDLE"
+# One of: IDLE, TRACKING, JITTERING, SETTLED
 
 
 def mouse_callback(
@@ -410,11 +520,13 @@ def mouse_callback(
 
     global target_x
     global target_y
+    global target_state
 
     if event == cv2.EVENT_LBUTTONDOWN:
 
         target_x = x
         target_y = y
+        target_state = "IDLE"
 
         print()
         print(
@@ -427,11 +539,7 @@ def mouse_callback(
 # DRAW LASER
 # ============================================================
 
-def draw_laser(
-    output,
-    laser_x,
-    laser_y
-):
+def draw_laser(output, laser_x, laser_y):
 
     if laser_x is None:
         return
@@ -439,34 +547,16 @@ def draw_laser(
     x = int(laser_x)
     y = int(laser_y)
 
-    # Center
-    cv2.circle(
-        output,
-        (x, y),
-        8,
-        (0, 0, 255),
-        -1
-    )
+    cv2.circle(output, (x, y), 8, (0, 0, 255), -1)
 
-    # Crosshair
     cv2.drawMarker(
-        output,
-        (x, y),
-        (0, 0, 255),
-        cv2.MARKER_CROSS,
-        30,
-        2
+        output, (x, y), (0, 0, 255),
+        cv2.MARKER_CROSS, 30, 2
     )
 
-    # Coordinates
     cv2.putText(
-        output,
-        f"Laser: ({x}, {y})",
-        (x + 15, y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 255),
-        2
+        output, f"Laser: ({x}, {y})", (x + 15, y),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
     )
 
 
@@ -474,12 +564,7 @@ def draw_laser(
 # DRAW TARGET
 # ============================================================
 
-def draw_target(
-    output,
-    target_x,
-    target_y,
-    laser_x
-):
+def draw_target(output, target_x, target_y, laser_x):
 
     if target_x is None:
         return
@@ -487,40 +572,21 @@ def draw_target(
     x = int(target_x)
     y = int(target_y)
 
-    # Blue target marker
-
     cv2.drawMarker(
-        output,
-        (x, y),
-        (255, 0, 0),
-        cv2.MARKER_CROSS,
-        30,
-        2
+        output, (x, y), (255, 0, 0),
+        cv2.MARKER_CROSS, 30, 2
     )
 
     cv2.putText(
-        output,
-        f"Target: ({x}, {y})",
-        (x + 15, y + 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 0, 0),
-        2
+        output, f"Target: ({x}, {y})", (x + 15, y + 30),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2
     )
-
-    # Horizontal error line
 
     if laser_x is not None:
 
         lx = int(laser_x)
 
-        cv2.line(
-            output,
-            (lx, y),
-            (x, y),
-            (255, 255, 0),
-            2
-        )
+        cv2.line(output, (lx, y), (x, y), (255, 255, 0), 2)
 
 
 # ============================================================
@@ -531,44 +597,19 @@ def main():
 
     global target_x
     global target_y
+    global target_state
 
-    # --------------------------------------------------------
-    # Camera
-    # --------------------------------------------------------
-
-    cap = cv2.VideoCapture(
-        CAMERA_DEVICE,
-        cv2.CAP_V4L2
-    )
+    cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
 
     if not cap.isOpened():
-
         raise RuntimeError(
-            f"Could not open camera "
-            f"/dev/video{CAMERA_DEVICE}"
+            f"Could not open camera /dev/video{CAMERA_DEVICE}"
         )
 
-    cap.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        FRAME_WIDTH
-    )
-
-    cap.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        FRAME_HEIGHT
-    )
-
-    cap.set(
-        cv2.CAP_PROP_FPS,
-        FRAME_FPS
-    )
-
-    cap.set(
-        cv2.CAP_PROP_FOURCC,
-        cv2.VideoWriter_fourcc(
-            *"MJPG"
-        )
-    )
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, FRAME_FPS)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
     time.sleep(0.5)
 
@@ -578,35 +619,9 @@ def main():
     print("==========================================")
     print()
     print(f"Camera       : /dev/video{CAMERA_DEVICE}")
-    print(
-        f"Resolution   : "
-        f"{FRAME_WIDTH}x{FRAME_HEIGHT}"
-    )
-    print(
-        f"PWM          : {PWM_PATH}"
-    )
-    print(
-        f"Frequency    : {PWM_FREQUENCY} Hz"
-    )
-    print(
-        f"Pulse range  : "
-        f"{MIN_PULSE_US}-{MAX_PULSE_US} us"
-    )
-    print()
-    print("LASER DETECTOR")
-    print(
-        f"Brightness   : "
-        f"{BRIGHTNESS_MIN}-{BRIGHTNESS_MAX}"
-    )
-    print(
-        f"Kernel       : "
-        f"{MORPH_KERNEL_SIZE}x"
-        f"{MORPH_KERNEL_SIZE}"
-    )
-    print(
-        f"Min area     : "
-        f"{MIN_BLOB_AREA}"
-    )
+    print(f"Resolution   : {FRAME_WIDTH}x{FRAME_HEIGHT}")
+    print(f"PWM          : {PWM_PATH}")
+    print(f"Pulse range  : {MIN_PULSE_US}-{MAX_PULSE_US} us")
     print()
     print("CONTROLS")
     print("  Left click  = select target")
@@ -614,194 +629,197 @@ def main():
     print("  C           = cancel target")
     print("  Q           = quit")
     print()
-    print(
-        f"Log file: {LOG_FILE}"
-    )
+    print(f"Log file       : {LOG_FILE}")
+    print(f"Extra log file : {EXTRA_LOG_FILE}")
     print()
-
-    # --------------------------------------------------------
-    # PWM
-    # --------------------------------------------------------
 
     setup_pwm()
 
-    pulse_us = float(
-        NEUTRAL_PULSE_US
-    )
-
-    # --------------------------------------------------------
-    # Logging
-    # --------------------------------------------------------
+    pulse_us = float(NEUTRAL_PULSE_US)
 
     setup_logging()
-    
-    
+    setup_extra_logging()
     setup_video_writer(FRAME_WIDTH, FRAME_HEIGHT, FRAME_FPS)
 
     if video_writer is not None:
         print(f"Video file: {VIDEO_FILE}")
-    # --------------------------------------------------------
-    # Window
-    # --------------------------------------------------------
 
-    WINDOW_NAME = (
-        "Camera + Laser + Servo"
-    )
+    WINDOW_NAME = "Camera + Laser + Servo"
+    MASK_WINDOW = "Brightness Mask"
 
-    MASK_WINDOW = (
-        "Brightness Mask"
-    )
-
-    cv2.namedWindow(
-        WINDOW_NAME,
-        cv2.WINDOW_NORMAL
-    )
-
-    cv2.namedWindow(
-        MASK_WINDOW,
-        cv2.WINDOW_NORMAL
-    )
-
-    cv2.resizeWindow(
-        WINDOW_NAME,
-        FRAME_WIDTH,
-        FRAME_HEIGHT
-    )
-
-    cv2.setMouseCallback(
-        WINDOW_NAME,
-        mouse_callback
-    )
-
-    # --------------------------------------------------------
-    # State
-    # --------------------------------------------------------
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(MASK_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
+    cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
 
     tracking = False
-
     frame_number = 0
 
-    # FPS
     fps = 0
     fps_count = 0
     fps_start = time.monotonic()
 
     last_servo_update = 0
-    SERVO_UPDATE_INTERVAL = 0.10
+
+    filtered_x = None
+
+    last_accepted_x = None
+    last_accepted_y = None
+    last_accept_time = None
+
+    adam_m = 0.0
+    adam_v = 0.0
+    adam_t = 0
+
+    jitter_start_time = None
+    jitter_base_pulse = None
 
     try:
-        filtered_x = None
-        ALPHA = 0.4  # lower = smoother, laggier
+
         while True:
 
             frame_number += 1
 
-            # ------------------------------------------------
-            # Camera
-            # ------------------------------------------------
-
             ret, frame = cap.read()
 
             if not ret:
-
-                print(
-                    "[CAMERA] Failed to read frame"
-                )
-
+                print("[CAMERA] Failed to read frame")
                 continue
 
             # ------------------------------------------------
-            # Laser detection
+            # Laser detection with continuity gating
             # ------------------------------------------------
 
             (
-                laser_x,
-                laser_y,
-                blob_area,
-                mask,
-                num_contours
-            ) = detect_laser(frame)
+                raw_x, raw_y, blob_area, mask, num_contours,
+                num_candidates, jumped, jump_distance
+            ) = detect_laser(frame, last_accepted_x, last_accepted_y)
+
+            reacquire_stale = (
+                last_accept_time is not None
+                and time.monotonic() - last_accept_time > REACQUIRE_TIMEOUT
+            )
+
+            detection_rejected = False
+
+            if raw_x is not None and (not jumped or reacquire_stale):
+
+                laser_x, laser_y = raw_x, raw_y
+                last_accepted_x, last_accepted_y = raw_x, raw_y
+                last_accept_time = time.monotonic()
+
+            elif raw_x is not None and jumped:
+
+                laser_x, laser_y = None, None
+                detection_rejected = True
+
+            else:
+
+                laser_x, laser_y = None, None
 
             # ------------------------------------------------
-            # Calculate error
+            # Control
             # ------------------------------------------------
 
             error_x = None
+            correction = None
+            ease = None
+            jitter_offset = None
 
-            if (
-                target_x is not None
-                and laser_x is not None
-                and time.monotonic() - last_servo_update >= SERVO_UPDATE_INTERVAL
-            ):
-                filtered_x = laser_x if filtered_x is None else ALPHA * laser_x + (1 - ALPHA) * filtered_x
-                error_x = (
-                    target_x - filtered_x
-                )
+            if target_x is not None:
 
-                # --------------------------------------------
-                # Check whether target is reached
-                # --------------------------------------------
+                if target_state == "IDLE" and laser_x is not None:
+                    target_state = "TRACKING"
 
-                if abs(error_x) <= PIXEL_DEADBAND:
+                if (
+                    target_state == "TRACKING"
+                    and laser_x is not None
+                    and time.monotonic() - last_servo_update >= SERVO_UPDATE_INTERVAL
+                ):
 
-                    tracking = False
-
-                else:
-
-                    tracking = True
-
-                    # ----------------------------------------
-                    # Proportional correction
-                    # ----------------------------------------
-
-                    correction = (
-                        -PIXEL_TO_US
-                        * error_x
+                    filtered_x = (
+                        laser_x if filtered_x is None
+                        else ALPHA * laser_x + (1 - ALPHA) * filtered_x
                     )
 
-                    # ----------------------------------------
-                    # Limit correction
-                    # ----------------------------------------
+                    error_x = target_x - filtered_x
 
-                    correction = max(
-                        -MAX_STEP_US,
-                        min(
-                            MAX_STEP_US,
-                            correction
+                    if abs(error_x) <= PIXEL_DEADBAND:
+
+                        tracking = False
+                        target_state = "JITTERING" if JITTER_ENABLE else "SETTLED"
+                        jitter_start_time = time.monotonic()
+                        jitter_base_pulse = pulse_us
+
+                    else:
+
+                        tracking = True
+
+                        grad = error_x
+                        adam_t += 1
+                        adam_m = ADAM_BETA1 * adam_m + (1 - ADAM_BETA1) * grad
+                        adam_v = ADAM_BETA2 * adam_v + (1 - ADAM_BETA2) * (grad ** 2)
+
+                        m_hat = adam_m / (1 - ADAM_BETA1 ** adam_t)
+                        v_hat = adam_v / (1 - ADAM_BETA2 ** adam_t)
+
+                        adam_step = ADAM_LR * m_hat / (math.sqrt(v_hat) + ADAM_EPS)
+
+                        ease = min(1.0, abs(error_x) / EASE_DISTANCE_PX)
+
+                        correction = -adam_step * ease
+
+                        correction = max(
+                            -MAX_STEP_US,
+                            min(MAX_STEP_US, correction)
                         )
-                    )
 
-                    pulse_us += correction
-
-                    # ----------------------------------------
-                    # Servo limits
-                    # ----------------------------------------
-
-                    pulse_us = max(
-                        MIN_PULSE_US,
-                        min(
-                            MAX_PULSE_US,
-                            pulse_us
+                        pulse_us += correction
+                        pulse_us = max(
+                            MIN_PULSE_US,
+                            min(MAX_PULSE_US, pulse_us)
                         )
-                    )
 
-                    # ----------------------------------------
-                    # Set servo
-                    # ----------------------------------------
+                        set_pulse_us(pulse_us)
 
-                    set_pulse_us(
-                        pulse_us
-                    )
-                    
-                    last_servo_update = time.monotonic()
+                        last_servo_update = time.monotonic()
 
-                    # ----------------------------------------
-                    # Allow servo to move
-                    # ----------------------------------------
+                elif target_state == "JITTERING":
 
-                    # time.sleep(
-                    #     SERVO_SETTLE_TIME
-                    # )
+                    # Jitter is a deliberate motion, independent of
+                    # whether the laser happens to be detected this
+                    # exact frame — it doesn't need laser_x.
+
+                    elapsed = time.monotonic() - jitter_start_time
+
+                    if elapsed >= JITTER_DURATION_S:
+
+                        target_state = "SETTLED"
+                        pulse_us = jitter_base_pulse
+                        set_pulse_us(pulse_us)
+
+                    else:
+
+                        sine_component = JITTER_AMPLITUDE_US * math.sin(
+                            2 * math.pi * JITTER_FREQUENCY_HZ * elapsed
+                        )
+                        noise_component = JITTER_AMPLITUDE_US * random.uniform(-1, 1)
+
+                        jitter_offset = (
+                            (1 - JITTER_RANDOMNESS) * sine_component
+                            + JITTER_RANDOMNESS * noise_component
+                        )
+
+                        jitter_pulse = jitter_base_pulse + jitter_offset
+                        jitter_pulse = max(
+                            MIN_PULSE_US,
+                            min(MAX_PULSE_US, jitter_pulse)
+                        )
+
+                        set_pulse_us(jitter_pulse)
+                        pulse_us = jitter_pulse
+
+                # SETTLED: nothing to do — servo holds still.
 
             # ------------------------------------------------
             # Output image
@@ -809,185 +827,112 @@ def main():
 
             output = frame.copy()
 
-            draw_laser(
-                output,
-                laser_x,
-                laser_y
-            )
+            draw_laser(output, laser_x, laser_y)
+            draw_target(output, target_x, target_y, laser_x)
 
-            draw_target(
-                output,
-                target_x,
-                target_y,
-                laser_x
-            )
-
-            # ------------------------------------------------
-            # Status
-            # ------------------------------------------------
-
-            if laser_x is None:
-
-                status = (
-                    "LASER NOT DETECTED"
-                )
-
-                status_color = (
-                    0, 0, 255
-                )
-
+            if laser_x is None and not detection_rejected:
+                status = "LASER NOT DETECTED"
+                status_color = (0, 0, 255)
+            elif detection_rejected:
+                status = "DETECTION REJECTED (jump)"
+                status_color = (0, 128, 255)
             elif target_x is None:
-
-                status = (
-                    "CLICK TO SELECT TARGET"
-                )
-
-                status_color = (
-                    255, 255, 0
-                )
-
-            elif tracking:
-
+                status = "CLICK TO SELECT TARGET"
+                status_color = (255, 255, 0)
+            elif target_state == "TRACKING" and tracking:
                 status = "TRACKING"
-
-                status_color = (
-                    0, 255, 255
-                )
-
+                status_color = (0, 255, 255)
+            elif target_state == "JITTERING":
+                status = "JITTERING"
+                status_color = (255, 0, 255)
+            elif target_state == "SETTLED":
+                status = "TARGET REACHED (settled)"
+                status_color = (0, 255, 0)
             else:
-
                 status = "TARGET REACHED"
-
-                status_color = (
-                    0, 255, 0
-                )
+                status_color = (0, 255, 0)
 
             cv2.putText(
-                output,
-                status,
-                (30, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                status_color,
-                2
-            )
-
-            # ------------------------------------------------
-            # Debug information
-            # ------------------------------------------------
-
-            cv2.putText(
-                output,
-                f"Pulse: {pulse_us:.1f} us",
-                (30, 80),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
+                output, status, (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2
             )
 
             cv2.putText(
-                output,
-                f"Blob area: {blob_area:.1f}",
-                (30, 115),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
+                output, f"Pulse: {pulse_us:.1f} us", (30, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
             )
 
             cv2.putText(
-                output,
-                f"Contours: {num_contours}",
+                output, f"Blob area: {blob_area:.1f}", (30, 115),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
+            )
+
+            cv2.putText(
+                output, f"Contours: {num_contours} (candidates: {num_candidates})",
                 (30, 150),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
             )
 
             if error_x is not None:
-
                 cv2.putText(
-                    output,
-                    f"X Error: {error_x:+.1f} px",
-                    (30, 185),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2
+                    output, f"X Error: {error_x:+.1f} px", (30, 185),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
                 )
 
-            # ------------------------------------------------
-            # FPS
-            # ------------------------------------------------
-
             fps_count += 1
-
             now = time.monotonic()
 
             if now - fps_start >= 1.0:
-
-                fps = (
-                    fps_count
-                    / (now - fps_start)
-                )
-
+                fps = fps_count / (now - fps_start)
                 fps_count = 0
                 fps_start = now
 
             cv2.putText(
-                output,
-                f"FPS: {fps:.1f}",
-                (30, 220),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2
+                output, f"FPS: {fps:.1f}", (30, 220),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
             )
 
-            # ------------------------------------------------
-            # Display
-            # ------------------------------------------------
-
-            cv2.imshow(
-                WINDOW_NAME,
-                output
-            )
-
-            cv2.imshow(
-                MASK_WINDOW,
-                mask
-            )
+            cv2.imshow(WINDOW_NAME, output)
+            cv2.imshow(MASK_WINDOW, mask)
 
             if video_writer is not None:
-
-                mask_bgr = cv2.cvtColor(
-                    mask,
-                    cv2.COLOR_GRAY2BGR
-                )
-
-                combined = np.hstack(
-                    (output, mask_bgr)
-                )
-
+                mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                combined = np.hstack((output, mask_bgr))
                 video_writer.write(combined)
+
             # ------------------------------------------------
-            # Log
+            # Logging (original — untouched)
             # ------------------------------------------------
 
             log_data(
-                frame_number,
-                target_x,
-                target_y,
-                laser_x,
-                laser_y,
-                error_x,
-                pulse_us,
-                blob_area,
-                num_contours,
-                tracking
+                frame_number, target_x, target_y, laser_x, laser_y,
+                error_x, pulse_us, blob_area, num_contours, tracking
             )
+
+            # ------------------------------------------------
+            # Logging (new — extra diagnostic log)
+            # ------------------------------------------------
+
+            log_extra_data({
+                "frame": frame_number,
+                "status_text": status,
+                "target_state": target_state,
+                "raw_laser_x": raw_x,
+                "raw_laser_y": raw_y,
+                "filtered_x": filtered_x,
+                "num_candidates": num_candidates,
+                "jumped": jumped,
+                "jump_distance": jump_distance,
+                "detection_rejected": detection_rejected,
+                "error_x": error_x,
+                "adam_m": adam_m,
+                "adam_v": adam_v,
+                "adam_step": (correction / -ease) if (correction is not None and ease) else None,
+                "ease_factor": ease,
+                "correction_us": correction,
+                "pulse_us": pulse_us,
+                "jitter_offset_us": jitter_offset,
+            })
 
             # ------------------------------------------------
             # Keyboard
@@ -995,94 +940,72 @@ def main():
 
             key = cv2.waitKey(1) & 0xFF
 
-            # Quit
-
             if key == ord("q"):
-
                 break
-
-            # Neutral
 
             elif key == ord("r"):
 
-                pulse_us = float(
-                    NEUTRAL_PULSE_US
-                )
-
-                set_pulse_us(
-                    pulse_us
-                )
+                pulse_us = float(NEUTRAL_PULSE_US)
+                set_pulse_us(pulse_us)
 
                 target_x = None
                 target_y = None
+                target_state = "IDLE"
                 tracking = False
+                adam_m = 0.0
+                adam_v = 0.0
+                adam_t = 0
+                filtered_x = None
 
                 print()
-                print(
-                    "[SERVO] "
-                    "Returned to 1500 us"
-                )
-
-            # Cancel target
+                print("[SERVO] Returned to 1500 us")
 
             elif key == ord("c"):
 
                 target_x = None
                 target_y = None
+                target_state = "IDLE"
                 tracking = False
+                adam_m = 0.0
+                adam_v = 0.0
+                adam_t = 0
+                filtered_x = None
 
                 print()
-                print(
-                    "[TARGET] Cancelled"
-                )
+                print("[TARGET] Cancelled")
 
     finally:
 
         print()
-        print(
-            "Returning servo to neutral..."
-        )
+        print("Returning servo to neutral...")
 
         try:
-
-            set_pulse_us(
-                NEUTRAL_PULSE_US
-            )
-
+            set_pulse_us(NEUTRAL_PULSE_US)
             time.sleep(0.5)
-
         except Exception as e:
-
-            print(
-                f"Could not return to neutral: {e}"
-            )
+            print(f"Could not return to neutral: {e}")
 
         stop_pwm()
-
         cap.release()
-
         cv2.destroyAllWindows()
 
         if log_file is not None:
             log_file.close()
 
+        if extra_log_file is not None:
+            extra_log_file.close()
+
         print()
-        print(
-            f"Log saved to:"
-        )
-        print(
-            f"  {LOG_FILE}"
-        )
+        print(f"Log saved to:\n  {LOG_FILE}")
+        print(f"Extra log saved to:\n  {EXTRA_LOG_FILE}")
+
         if video_writer is not None:
             video_writer.release()
             print(f"Video saved to:\n  {VIDEO_FILE}")
+
         print()
         print("Done.")
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
