@@ -55,30 +55,6 @@ MORPH_KERNEL_SIZE = 3
 
 MIN_BLOB_AREA = 4
 
-# --------------------------------------------------------
-# NEW: detection continuity gating
-#
-# Prevents the detector from "flipping" between two
-# real bright blobs (e.g. the laser dot and a reflection)
-# frame to frame, which was the actual cause of the
-# oscillation seen in the CSV log — not a gain problem.
-# --------------------------------------------------------
-
-MAX_JUMP_PX = 150
-# Largest frame-to-frame centroid movement (px) that is
-# accepted as "the same blob." A candidate blob farther
-# than this from the last accepted position is treated as
-# a false detection for that frame and ignored.
-# Too low  -> genuine fast laser motion gets rejected.
-# Too high -> lets the reflection-jump problem back in.
-
-REACQUIRE_TIMEOUT = 1.0
-# If no candidate has been accepted for this many seconds
-# (e.g. the real laser was genuinely occluded/moved far),
-# gating is dropped for one frame so tracking can recover
-# instead of staying locked onto a stale position forever.
-
-
 # ============================================================
 # CONTROL
 # ============================================================
@@ -103,6 +79,13 @@ ALPHA = 0.4
 # --------------------------------------------------------
 
 ADAM_LR = 8
+# NOTE: unlike the old PIXEL_TO_US, this is NOT a per-pixel
+# gain. Adam normalizes the step by the gradient's own recent
+# magnitude, so after the first update the raw step settles to
+# roughly +/- ADAM_LR regardless of error size. Set this to the
+# step size (us) you want on LARGE errors -- the actual
+# "smaller steps near target" behavior comes from EASE_DISTANCE_PX
+# below, not from this value shrinking on its own.
 ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-3
@@ -279,13 +262,11 @@ EXTRA_LOG_FIELDS = [
     "frame",
     "status_text",
     "target_state",
-    "raw_laser_x",
-    "raw_laser_y",
+    "sequence_running",
+    "queue_remaining",
+    "laser_x",
+    "laser_y",
     "filtered_x",
-    "num_candidates",
-    "jumped",
-    "jump_distance",
-    "detection_rejected",
     "error_x",
     "adam_m",
     "adam_v",
@@ -412,13 +393,12 @@ def stop_pwm():
 # ============================================================
 # LASER DETECTION
 #
-# NEW: returns ALL candidate blobs (not just the largest),
-# then selects the one closest to the last accepted position
-# instead of the largest one. Also reports whether the pick
-# was a suspicious jump.
+# Restored to your original implementation — largest bright
+# blob wins, no continuity gating. The gating introduced
+# false rejections/misses, so it's removed rather than tuned.
 # ============================================================
 
-def detect_laser(frame, last_x=None, last_y=None):
+def detect_laser(frame):
 
     gray = cv2.cvtColor(
         frame,
@@ -448,7 +428,8 @@ def detect_laser(frame, last_x=None, last_y=None):
         cv2.CHAIN_APPROX_SIMPLE
     )
 
-    candidates = []
+    best = None
+    best_area = 0
 
     for contour in contours:
 
@@ -457,47 +438,22 @@ def detect_laser(frame, last_x=None, last_y=None):
         if area < MIN_BLOB_AREA:
             continue
 
-        M = cv2.moments(contour)
+        if area > best_area:
+            best = contour
+            best_area = area
 
-        if M["m00"] == 0:
-            continue
+    if best is None:
+        return None, None, 0, mask, len(contours)
 
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
+    M = cv2.moments(best)
 
-        candidates.append((cx, cy, area))
+    if M["m00"] == 0:
+        return None, None, 0, mask, len(contours)
 
-    num_candidates = len(candidates)
+    cx = int(M["m10"] / M["m00"])
+    cy = int(M["m01"] / M["m00"])
 
-    if num_candidates == 0:
-        return None, None, 0, mask, len(contours), 0, False, None
-
-    if last_x is None or last_y is None:
-
-        # No prior position to compare against yet —
-        # fall back to largest blob (original behavior)
-        # for initial acquisition only.
-
-        cx, cy, area = max(candidates, key=lambda c: c[2])
-
-        return (
-            cx, cy, area, mask, len(contours),
-            num_candidates, False, None
-        )
-
-    def dist(c):
-        return math.hypot(c[0] - last_x, c[1] - last_y)
-
-    cx, cy, area = min(candidates, key=dist)
-
-    distance = dist((cx, cy, area))
-
-    jumped = distance > MAX_JUMP_PX
-
-    return (
-        cx, cy, area, mask, len(contours),
-        num_candidates, jumped, distance
-    )
+    return cx, cy, best_area, mask, len(contours)
 
 
 # ============================================================
@@ -509,6 +465,15 @@ target_y = None
 target_state = "IDLE"
 # One of: IDLE, TRACKING, JITTERING, SETTLED
 
+pending_targets = []
+# Queue of (x, y) tuples clicked but not yet active. Filled by
+# clicking before pressing G; consumed one at a time once the
+# sequence is running.
+
+sequence_running = False
+# True from the moment G is pressed until the queue is empty
+# and the last target has settled.
+
 
 def mouse_callback(
     event,
@@ -518,19 +483,26 @@ def mouse_callback(
     param
 ):
 
-    global target_x
-    global target_y
-    global target_state
+    global pending_targets
+    global sequence_running
 
     if event == cv2.EVENT_LBUTTONDOWN:
 
-        target_x = x
-        target_y = y
-        target_state = "IDLE"
+        if sequence_running:
+
+            print()
+            print(
+                "[QUEUE] Sequence already running — "
+                "press C to cancel before queuing new targets"
+            )
+
+            return
+
+        pending_targets.append((x, y))
 
         print()
         print(
-            f"[TARGET] "
+            f"[QUEUE] Added target #{len(pending_targets)}: "
             f"x={x}, y={y}"
         )
 
@@ -590,6 +562,22 @@ def draw_target(output, target_x, target_y, laser_x):
 
 
 # ============================================================
+# DRAW QUEUE
+# ============================================================
+
+def draw_queue(output, pending_targets):
+
+    for i, (x, y) in enumerate(pending_targets):
+
+        cv2.circle(output, (x, y), 6, (0, 165, 255), 2)
+
+        cv2.putText(
+            output, str(i + 1), (x + 8, y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1
+        )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -598,6 +586,8 @@ def main():
     global target_x
     global target_y
     global target_state
+    global pending_targets
+    global sequence_running
 
     cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
 
@@ -624,9 +614,10 @@ def main():
     print(f"Pulse range  : {MIN_PULSE_US}-{MAX_PULSE_US} us")
     print()
     print("CONTROLS")
-    print("  Left click  = select target")
-    print("  R           = neutral")
-    print("  C           = cancel target")
+    print("  Left click  = queue a target")
+    print("  G           = go — start tracking the queued targets in order")
+    print("  R           = neutral (also clears queue)")
+    print("  C           = cancel current target / sequence / queue")
     print("  Q           = quit")
     print()
     print(f"Log file       : {LOG_FILE}")
@@ -663,10 +654,6 @@ def main():
 
     filtered_x = None
 
-    last_accepted_x = None
-    last_accepted_y = None
-    last_accept_time = None
-
     adam_m = 0.0
     adam_v = 0.0
     adam_t = 0
@@ -687,35 +674,12 @@ def main():
                 continue
 
             # ------------------------------------------------
-            # Laser detection with continuity gating
+            # Laser detection (original implementation)
             # ------------------------------------------------
 
             (
-                raw_x, raw_y, blob_area, mask, num_contours,
-                num_candidates, jumped, jump_distance
-            ) = detect_laser(frame, last_accepted_x, last_accepted_y)
-
-            reacquire_stale = (
-                last_accept_time is not None
-                and time.monotonic() - last_accept_time > REACQUIRE_TIMEOUT
-            )
-
-            detection_rejected = False
-
-            if raw_x is not None and (not jumped or reacquire_stale):
-
-                laser_x, laser_y = raw_x, raw_y
-                last_accepted_x, last_accepted_y = raw_x, raw_y
-                last_accept_time = time.monotonic()
-
-            elif raw_x is not None and jumped:
-
-                laser_x, laser_y = None, None
-                detection_rejected = True
-
-            else:
-
-                laser_x, laser_y = None, None
+                laser_x, laser_y, blob_area, mask, num_contours
+            ) = detect_laser(frame)
 
             # ------------------------------------------------
             # Control
@@ -731,8 +695,16 @@ def main():
                 if target_state == "IDLE" and laser_x is not None:
                     target_state = "TRACKING"
 
+                # TRACKING and SETTLED both re-evaluate the real
+                # error on every throttled tick. This is what lets
+                # SETTLED resume TRACKING if the laser drifts back
+                # out of the deadband — previously SETTLED was a
+                # dead end that never checked again, which is why
+                # "TARGET REACHED" could get stuck showing even
+                # after the laser moved off target.
+
                 if (
-                    target_state == "TRACKING"
+                    target_state in ("TRACKING", "SETTLED")
                     and laser_x is not None
                     and time.monotonic() - last_servo_update >= SERVO_UPDATE_INTERVAL
                 ):
@@ -747,13 +719,23 @@ def main():
                     if abs(error_x) <= PIXEL_DEADBAND:
 
                         tracking = False
-                        target_state = "JITTERING" if JITTER_ENABLE else "SETTLED"
-                        jitter_start_time = time.monotonic()
-                        jitter_base_pulse = pulse_us
+
+                        if target_state == "TRACKING":
+                            # Just arrived — enter jitter/settle.
+                            target_state = "JITTERING" if JITTER_ENABLE else "SETTLED"
+                            jitter_start_time = time.monotonic()
+                            jitter_base_pulse = pulse_us
+                        # else: already SETTLED and still within
+                        # deadband — stay put, nothing to do.
 
                     else:
 
+                        # Either actively tracking, or drifted back
+                        # out of the deadband while SETTLED — in
+                        # both cases, (re)apply a correction.
+
                         tracking = True
+                        target_state = "TRACKING"
 
                         grad = error_x
                         adam_t += 1
@@ -782,7 +764,7 @@ def main():
 
                         set_pulse_us(pulse_us)
 
-                        last_servo_update = time.monotonic()
+                    last_servo_update = time.monotonic()
 
                 elif target_state == "JITTERING":
 
@@ -794,9 +776,35 @@ def main():
 
                     if elapsed >= JITTER_DURATION_S:
 
-                        target_state = "SETTLED"
                         pulse_us = jitter_base_pulse
                         set_pulse_us(pulse_us)
+
+                        if sequence_running and pending_targets:
+
+                            # Advance to the next queued target.
+
+                            target_x, target_y = pending_targets.pop(0)
+                            target_state = "IDLE"
+                            filtered_x = None
+                            adam_m = 0.0
+                            adam_v = 0.0
+                            adam_t = 0
+
+                            print()
+                            print(
+                                f"[SEQUENCE] Advancing to "
+                                f"x={target_x}, y={target_y} "
+                                f"({len(pending_targets)} remaining)"
+                            )
+
+                        else:
+
+                            target_state = "SETTLED"
+
+                            if sequence_running:
+                                sequence_running = False
+                                print()
+                                print("[SEQUENCE] Complete — all targets reached")
 
                     else:
 
@@ -829,15 +837,16 @@ def main():
 
             draw_laser(output, laser_x, laser_y)
             draw_target(output, target_x, target_y, laser_x)
+            draw_queue(output, pending_targets)
 
-            if laser_x is None and not detection_rejected:
+            if laser_x is None:
                 status = "LASER NOT DETECTED"
                 status_color = (0, 0, 255)
-            elif detection_rejected:
-                status = "DETECTION REJECTED (jump)"
-                status_color = (0, 128, 255)
+            elif target_x is None and pending_targets:
+                status = f"{len(pending_targets)} QUEUED — PRESS G TO GO"
+                status_color = (0, 165, 255)
             elif target_x is None:
-                status = "CLICK TO SELECT TARGET"
+                status = "CLICK TO QUEUE TARGET(S)"
                 status_color = (255, 255, 0)
             elif target_state == "TRACKING" and tracking:
                 status = "TRACKING"
@@ -857,6 +866,13 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2
             )
 
+            if sequence_running:
+                cv2.putText(
+                    output, f"SEQUENCE RUNNING ({len(pending_targets)} remaining)",
+                    (30, 255),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2
+                )
+
             cv2.putText(
                 output, f"Pulse: {pulse_us:.1f} us", (30, 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
@@ -868,7 +884,7 @@ def main():
             )
 
             cv2.putText(
-                output, f"Contours: {num_contours} (candidates: {num_candidates})",
+                output, f"Contours: {num_contours}",
                 (30, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
             )
@@ -917,13 +933,11 @@ def main():
                 "frame": frame_number,
                 "status_text": status,
                 "target_state": target_state,
-                "raw_laser_x": raw_x,
-                "raw_laser_y": raw_y,
+                "sequence_running": sequence_running,
+                "queue_remaining": len(pending_targets),
+                "laser_x": laser_x,
+                "laser_y": laser_y,
                 "filtered_x": filtered_x,
-                "num_candidates": num_candidates,
-                "jumped": jumped,
-                "jump_distance": jump_distance,
-                "detection_rejected": detection_rejected,
                 "error_x": error_x,
                 "adam_m": adam_m,
                 "adam_v": adam_v,
@@ -943,6 +957,35 @@ def main():
             if key == ord("q"):
                 break
 
+            elif key == ord("g"):
+
+                if not sequence_running and pending_targets:
+
+                    sequence_running = True
+                    target_x, target_y = pending_targets.pop(0)
+                    target_state = "IDLE"
+                    filtered_x = None
+                    adam_m = 0.0
+                    adam_v = 0.0
+                    adam_t = 0
+
+                    print()
+                    print(
+                        f"[SEQUENCE] Starting — "
+                        f"x={target_x}, y={target_y} "
+                        f"({len(pending_targets)} remaining)"
+                    )
+
+                elif sequence_running:
+
+                    print()
+                    print("[SEQUENCE] Already running")
+
+                else:
+
+                    print()
+                    print("[SEQUENCE] No queued targets — click to add some first")
+
             elif key == ord("r"):
 
                 pulse_us = float(NEUTRAL_PULSE_US)
@@ -956,6 +999,8 @@ def main():
                 adam_v = 0.0
                 adam_t = 0
                 filtered_x = None
+                pending_targets = []
+                sequence_running = False
 
                 print()
                 print("[SERVO] Returned to 1500 us")
@@ -970,6 +1015,8 @@ def main():
                 adam_v = 0.0
                 adam_t = 0
                 filtered_x = None
+                pending_targets = []
+                sequence_running = False
 
                 print()
                 print("[TARGET] Cancelled")
