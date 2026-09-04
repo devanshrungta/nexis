@@ -48,12 +48,12 @@ NEUTRAL_PULSE_US = 1500
 # LASER DETECTION
 # ============================================================
 
-BRIGHTNESS_MIN = 220
+BRIGHTNESS_MIN = 230
 BRIGHTNESS_MAX = 255
 
 MORPH_KERNEL_SIZE = 3
 
-MIN_BLOB_AREA = 4
+MIN_BLOB_AREA = 6
 
 # ============================================================
 # CONTROL
@@ -61,7 +61,13 @@ MIN_BLOB_AREA = 4
 
 PIXEL_DEADBAND = 15
 
-SERVO_UPDATE_INTERVAL = 0.10
+SERVO_UPDATE_INTERVAL = 0.08
+# Minimum time between corrections. Was 0.10 (stepping visibly
+# every 100ms on far targets); 0.0 means "update every frame,"
+# giving continuous motion — speed and slow-down near the target
+# now come entirely from ADAM_LR/EASE_DISTANCE_PX/MAX_STEP_US
+# rather than from a coarse fixed interval. Raise this only if
+# continuous updates reintroduce oscillation on your hardware.
 
 ALPHA = 0.4
 # EMA smoothing factor on the laser x position used for
@@ -90,7 +96,7 @@ ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-3
 
-EASE_DISTANCE_PX = 150
+EASE_DISTANCE_PX = 50
 # Distance (px) at which step size starts scaling down.
 # At |error| >= this value: full step. At |error| == 0:
 # step scaled to 0. Linear ramp in between.
@@ -107,21 +113,33 @@ MAX_STEP_US = 10
 # pulse around the settled position for a short time.
 # --------------------------------------------------------
 
-JITTER_ENABLE = True
+JITTER_ENABLE = False
 
-JITTER_AMPLITUDE_US = 5.0
+JITTER_AMPLITUDE_US = 30
 # How far (in us) the jitter swings from the settled pulse.
 # Larger = more visible/aggressive wiggle.
 
-JITTER_DURATION_S = 3.0
+JITTER_DURATION_S = 3
 # How long (seconds) to jitter after reaching target.
 
-JITTER_FREQUENCY_HZ = 3.0
+JITTER_FREQUENCY_HZ = 5.0
 # Speed of the sinusoidal component of the jitter.
 
-JITTER_RANDOMNESS = 0.3
+JITTER_RANDOMNESS = 0.0
 # Blend between smooth sine motion (0.0) and pure random
 # noise (1.0). e.g. 0.3 = mostly smooth with some noise.
+
+SETTLE_GRACE_PERIOD_S = 0.4
+# After entering SETTLED (jitter finished, or JITTER_ENABLE is
+# False), drift-recovery is paused for this many seconds before
+# SETTLED starts re-checking the real error again. Without this,
+# residual motion from the jitter itself (the servo/laser hasn't
+# mechanically caught up to the settled pulse yet) can read as
+# "still off target," bounce back into TRACKING, immediately
+# re-reach the deadband, and jitter again — forever.
+# Too short -> the jitter-loop bug can come back.
+# Too long  -> slower to notice genuine drift (e.g. the mount
+# gets bumped) once truly settled.
 
 
 # ============================================================
@@ -310,6 +328,64 @@ def log_extra_data(values):
     extra_csv_writer.writerow(row)
 
     extra_log_file.flush()
+
+
+# ============================================================
+# NEW: tuned-parameter dump
+#
+# Writes every tunable constant's active value to its own file
+# once at startup, so a given log/video can always be matched
+# back to the exact settings that produced it.
+# ============================================================
+
+PARAMS_LOG_FILE = os.path.join(
+    LOG_DIR,
+    f"laser_servo_{timestamp}_params.csv"
+)
+
+
+def get_tunable_params():
+
+    return {
+        "BRIGHTNESS_MIN": BRIGHTNESS_MIN,
+        "BRIGHTNESS_MAX": BRIGHTNESS_MAX,
+        "MORPH_KERNEL_SIZE": MORPH_KERNEL_SIZE,
+        "MIN_BLOB_AREA": MIN_BLOB_AREA,
+        "PIXEL_DEADBAND": PIXEL_DEADBAND,
+        "SERVO_UPDATE_INTERVAL": SERVO_UPDATE_INTERVAL,
+        "ALPHA": ALPHA,
+        "ADAM_LR": ADAM_LR,
+        "ADAM_BETA1": ADAM_BETA1,
+        "ADAM_BETA2": ADAM_BETA2,
+        "ADAM_EPS": ADAM_EPS,
+        "EASE_DISTANCE_PX": EASE_DISTANCE_PX,
+        "MAX_STEP_US": MAX_STEP_US,
+        "JITTER_ENABLE": JITTER_ENABLE,
+        "JITTER_AMPLITUDE_US": JITTER_AMPLITUDE_US,
+        "JITTER_DURATION_S": JITTER_DURATION_S,
+        "JITTER_FREQUENCY_HZ": JITTER_FREQUENCY_HZ,
+        "JITTER_RANDOMNESS": JITTER_RANDOMNESS,
+        "SETTLE_GRACE_PERIOD_S": SETTLE_GRACE_PERIOD_S,
+        "MIN_PULSE_US": MIN_PULSE_US,
+        "MAX_PULSE_US": MAX_PULSE_US,
+        "NEUTRAL_PULSE_US": NEUTRAL_PULSE_US,
+        "PWM_FREQUENCY": PWM_FREQUENCY,
+    }
+
+
+def save_params_log():
+
+    params = get_tunable_params()
+
+    with open(PARAMS_LOG_FILE, "w", newline="") as f:
+
+        writer = csv.writer(f)
+        writer.writerow(["parameter", "value"])
+
+        for key, value in params.items():
+            writer.writerow([key, value])
+
+    return params
 
 
 # ============================================================
@@ -578,6 +654,31 @@ def draw_queue(output, pending_targets):
 
 
 # ============================================================
+# DRAW TUNED PARAMETERS
+#
+# Bakes the active tunable settings into the corner of the
+# recorded video (and live window), so a saved clip is always
+# self-describing without needing to cross-reference the code
+# or the separate params CSV.
+# ============================================================
+
+def draw_params_overlay(output, params):
+
+    x0 = output.shape[1] - 280
+    y0 = 20
+    line_height = 15
+
+    for i, (key, value) in enumerate(params.items()):
+
+        text = f"{key}={value}"
+
+        cv2.putText(
+            output, text, (x0, y0 + i * line_height),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1
+        )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -622,6 +723,7 @@ def main():
     print()
     print(f"Log file       : {LOG_FILE}")
     print(f"Extra log file : {EXTRA_LOG_FILE}")
+    print(f"Params file    : {PARAMS_LOG_FILE}")
     print()
 
     setup_pwm()
@@ -630,16 +732,17 @@ def main():
 
     setup_logging()
     setup_extra_logging()
+    tunable_params = save_params_log()
     setup_video_writer(FRAME_WIDTH, FRAME_HEIGHT, FRAME_FPS)
 
     if video_writer is not None:
         print(f"Video file: {VIDEO_FILE}")
 
     WINDOW_NAME = "Camera + Laser + Servo"
-    MASK_WINDOW = "Brightness Mask"
+    RAW_WINDOW = "Raw Camera"
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(MASK_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(RAW_WINDOW, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
     cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
 
@@ -660,6 +763,7 @@ def main():
 
     jitter_start_time = None
     jitter_base_pulse = None
+    settled_since = None
 
     try:
 
@@ -695,16 +799,20 @@ def main():
                 if target_state == "IDLE" and laser_x is not None:
                     target_state = "TRACKING"
 
-                # TRACKING and SETTLED both re-evaluate the real
-                # error on every throttled tick. This is what lets
-                # SETTLED resume TRACKING if the laser drifts back
-                # out of the deadband — previously SETTLED was a
-                # dead end that never checked again, which is why
-                # "TARGET REACHED" could get stuck showing even
-                # after the laser moved off target.
+                # TRACKING always re-evaluates. SETTLED also
+                # re-evaluates, but only once SETTLE_GRACE_PERIOD_S
+                # has passed since settling — see the constant's
+                # comment for why the grace period exists.
+
+                settled_grace_elapsed = (
+                    target_state != "SETTLED"
+                    or settled_since is None
+                    or time.monotonic() - settled_since >= SETTLE_GRACE_PERIOD_S
+                )
 
                 if (
                     target_state in ("TRACKING", "SETTLED")
+                    and settled_grace_elapsed
                     and laser_x is not None
                     and time.monotonic() - last_servo_update >= SERVO_UPDATE_INTERVAL
                 ):
@@ -725,6 +833,7 @@ def main():
                             target_state = "JITTERING" if JITTER_ENABLE else "SETTLED"
                             jitter_start_time = time.monotonic()
                             jitter_base_pulse = pulse_us
+                            settled_since = time.monotonic()
                         # else: already SETTLED and still within
                         # deadband — stay put, nothing to do.
 
@@ -800,6 +909,7 @@ def main():
                         else:
 
                             target_state = "SETTLED"
+                            settled_since = time.monotonic()
 
                             if sequence_running:
                                 sequence_running = False
@@ -908,12 +1018,13 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
             )
 
+            draw_params_overlay(output, tunable_params)
+
             cv2.imshow(WINDOW_NAME, output)
-            cv2.imshow(MASK_WINDOW, mask)
+            cv2.imshow(RAW_WINDOW, frame)
 
             if video_writer is not None:
-                mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-                combined = np.hstack((output, mask_bgr))
+                combined = np.hstack((output, frame))
                 video_writer.write(combined)
 
             # ------------------------------------------------
@@ -1001,6 +1112,7 @@ def main():
                 filtered_x = None
                 pending_targets = []
                 sequence_running = False
+                settled_since = None
 
                 print()
                 print("[SERVO] Returned to 1500 us")
@@ -1017,6 +1129,7 @@ def main():
                 filtered_x = None
                 pending_targets = []
                 sequence_running = False
+                settled_since = None
 
                 print()
                 print("[TARGET] Cancelled")
