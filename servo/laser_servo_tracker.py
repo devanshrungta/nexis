@@ -59,63 +59,75 @@ MIN_BLOB_AREA = 6
 # CONTROL
 # ============================================================
 
-PIXEL_DEADBAND = 15
+SERVO_UPDATE_INTERVAL = 0.05
+# Minimum time between corrections. 0.0 = update every frame,
+# giving continuous motion (was 0.08 before, which visibly
+# "stepped" at ~12.5 updates/sec). Speed and slow-down now
+# come from GAIN_US_PER_PX / MAX_STEP_US below.
 
-SERVO_UPDATE_INTERVAL = 0.08
-# Minimum time between corrections. Was 0.10 (stepping visibly
-# every 100ms on far targets); 0.0 means "update every frame,"
-# giving continuous motion — speed and slow-down near the target
-# now come entirely from ADAM_LR/EASE_DISTANCE_PX/MAX_STEP_US
-# rather than from a coarse fixed interval. Raise this only if
-# continuous updates reintroduce oscillation on your hardware.
-
-ALPHA = 0.4
+ALPHA = 0.25
 # EMA smoothing factor on the laser x position used for
 # error calculation. Lower = smoother but laggier.
 
 # --------------------------------------------------------
-# NEW: Adam-style adaptive step
+# Clamped proportional (P) controller
 #
-# Replaces the flat PIXEL_TO_US proportional gain. See the
-# accompanying markdown for what each of these does — in
-# short: ADAM_LR is the base gain, BETA1/BETA2 control how
-# much recent error history smooths the step (this is what
-# resists single-frame noise/jump spikes), and EASE_DISTANCE_PX
-# is what actually forces smaller steps near the target.
+# Replaces the previous Adam-based controller. Adam normalizes
+# its step by the gradient's own recent magnitude, so the raw
+# step settles to roughly +/-ADAM_LR regardless of error size,
+# and its momentum term (an EMA of recent error) keeps pushing
+# in the old direction for several frames after the error flips
+# sign -- both of which produced the overshoot/oscillation you
+# were seeing whenever the gap was bigger than the deadband but
+# smaller than one step.
+#
+# A plain clamped P-controller fixes this: the commanded
+# correction is directly proportional to the remaining error
+# (so it decelerates smoothly and hits ~0 at ~0 error, no
+# separate "ease" term needed), and it has no memory of past
+# frames, so it can't keep pushing after crossing the target.
 # --------------------------------------------------------
 
-ADAM_LR = 8
-# NOTE: unlike the old PIXEL_TO_US, this is NOT a per-pixel
-# gain. Adam normalizes the step by the gradient's own recent
-# magnitude, so after the first update the raw step settles to
-# roughly +/- ADAM_LR regardless of error size. Set this to the
-# step size (us) you want on LARGE errors -- the actual
-# "smaller steps near target" behavior comes from EASE_DISTANCE_PX
-# below, not from this value shrinking on its own.
-ADAM_BETA1 = 0.9
-ADAM_BETA2 = 0.999
-ADAM_EPS = 1e-3
+GAIN_US_PER_PX = 0.025
+# How many microseconds of pulse-width correction to command
+# per pixel of remaining error. This should reflect (or be
+# slightly BELOW) the real system response -- i.e. how many us
+# it actually takes to move the laser 1px. Set too high, it can
+# still overshoot despite the clamp; set too low, it just takes
+# a few extra frames to converge. Tune by watching the "X Error"
+# overlay: if it overshoots past zero, lower this; if it's
+# sluggish on small errors, raise it.
 
-EASE_DISTANCE_PX = 50
-# Distance (px) at which step size starts scaling down.
-# At |error| >= this value: full step. At |error| == 0:
-# step scaled to 0. Linear ramp in between.
+MAX_STEP_US = 25
+# Hard cap on any single correction (top speed for large
+# errors). Raise this to close large gaps faster; the P-control
+# proportionality is what prevents overshoot on the way in, not
+# this cap.
 
-MAX_STEP_US = 10
-# Hard safety cap on any single correction, regardless of
-# what Adam/easing compute.
+SETTLE_DEADBAND_PX = 5
+# Error must be within this many px to be considered "reached"
+# and enter SETTLED. Kept tight for precision -- with a P-
+# controller (not a fixed step), getting this close does not
+# cause oscillation the way the old fixed-step approach did.
+
+RETRACK_DEADBAND_PX = 20
+# Once SETTLED, the laser must drift out past THIS looser
+# threshold before correction resumes. This hysteresis gap
+# between SETTLE_DEADBAND_PX and RETRACK_DEADBAND_PX stops
+# detection noise right at the settle boundary from repeatedly
+# flapping the state back into TRACKING.
 
 
 # --------------------------------------------------------
-# NEW: post-target jitter
+# Post-target jitter
 #
 # After the target is reached, deliberately wiggles the
 # pulse around the settled position for a short time.
 # --------------------------------------------------------
 
-JITTER_ENABLE = False
+JITTER_ENABLE = True
 
-JITTER_AMPLITUDE_US = 30
+JITTER_AMPLITUDE_US = 35
 # How far (in us) the jitter swings from the settled pulse.
 # Larger = more visible/aggressive wiggle.
 
@@ -136,14 +148,14 @@ SETTLE_GRACE_PERIOD_S = 0.4
 # residual motion from the jitter itself (the servo/laser hasn't
 # mechanically caught up to the settled pulse yet) can read as
 # "still off target," bounce back into TRACKING, immediately
-# re-reach the deadband, and jitter again — forever.
+# re-reach the deadband, and jitter again -- forever.
 # Too short -> the jitter-loop bug can come back.
 # Too long  -> slower to notice genuine drift (e.g. the mount
 # gets bumped) once truly settled.
 
 
 # ============================================================
-# LOGGING (unchanged — original log/video files)
+# LOGGING (unchanged -- original log/video files)
 # ============================================================
 
 LOG_DIR = "servo_logs"
@@ -260,7 +272,7 @@ def log_data(
 
 
 # ============================================================
-# NEW: separate diagnostic log
+# Separate diagnostic log
 #
 # Does not touch LOG_FILE/log_data above. Captures everything
 # needed to debug detection + control behavior from the CSV
@@ -286,10 +298,6 @@ EXTRA_LOG_FIELDS = [
     "laser_y",
     "filtered_x",
     "error_x",
-    "adam_m",
-    "adam_v",
-    "adam_step",
-    "ease_factor",
     "correction_us",
     "pulse_us",
     "jitter_offset_us",
@@ -331,7 +339,7 @@ def log_extra_data(values):
 
 
 # ============================================================
-# NEW: tuned-parameter dump
+# Tuned-parameter dump
 #
 # Writes every tunable constant's active value to its own file
 # once at startup, so a given log/video can always be matched
@@ -351,15 +359,12 @@ def get_tunable_params():
         "BRIGHTNESS_MAX": BRIGHTNESS_MAX,
         "MORPH_KERNEL_SIZE": MORPH_KERNEL_SIZE,
         "MIN_BLOB_AREA": MIN_BLOB_AREA,
-        "PIXEL_DEADBAND": PIXEL_DEADBAND,
         "SERVO_UPDATE_INTERVAL": SERVO_UPDATE_INTERVAL,
         "ALPHA": ALPHA,
-        "ADAM_LR": ADAM_LR,
-        "ADAM_BETA1": ADAM_BETA1,
-        "ADAM_BETA2": ADAM_BETA2,
-        "ADAM_EPS": ADAM_EPS,
-        "EASE_DISTANCE_PX": EASE_DISTANCE_PX,
+        "GAIN_US_PER_PX": GAIN_US_PER_PX,
         "MAX_STEP_US": MAX_STEP_US,
+        "SETTLE_DEADBAND_PX": SETTLE_DEADBAND_PX,
+        "RETRACK_DEADBAND_PX": RETRACK_DEADBAND_PX,
         "JITTER_ENABLE": JITTER_ENABLE,
         "JITTER_AMPLITUDE_US": JITTER_AMPLITUDE_US,
         "JITTER_DURATION_S": JITTER_DURATION_S,
@@ -469,9 +474,7 @@ def stop_pwm():
 # ============================================================
 # LASER DETECTION
 #
-# Restored to your original implementation — largest bright
-# blob wins, no continuity gating. The gating introduced
-# false rejections/misses, so it's removed rather than tuned.
+# Largest bright blob wins, no continuity gating.
 # ============================================================
 
 def detect_laser(frame):
@@ -568,7 +571,7 @@ def mouse_callback(
 
             print()
             print(
-                "[QUEUE] Sequence already running — "
+                "[QUEUE] Sequence already running -- "
                 "press C to cancel before queuing new targets"
             )
 
@@ -716,7 +719,7 @@ def main():
     print()
     print("CONTROLS")
     print("  Left click  = queue a target")
-    print("  G           = go — start tracking the queued targets in order")
+    print("  G           = go -- start tracking the queued targets in order")
     print("  R           = neutral (also clears queue)")
     print("  C           = cancel current target / sequence / queue")
     print("  Q           = quit")
@@ -757,13 +760,52 @@ def main():
 
     filtered_x = None
 
-    adam_m = 0.0
-    adam_v = 0.0
-    adam_t = 0
-
     jitter_start_time = None
     jitter_base_pulse = None
     settled_since = None
+
+    # --------------------------------------------------------
+    # Reaching a target either advances to the next queued
+    # target, or settles (with the sequence-complete message)
+    # if the queue is empty. Both the "jitter finished" path
+    # and the "jitter disabled" path call this -- previously
+    # this logic lived ONLY inside the JITTERING branch, so
+    # disabling jitter meant the queue never advanced past the
+    # first target.
+    # --------------------------------------------------------
+
+    def advance_or_settle():
+
+        nonlocal filtered_x
+        nonlocal settled_since
+
+        global target_x
+        global target_y
+        global target_state
+        global sequence_running
+
+        if sequence_running and pending_targets:
+
+            target_x, target_y = pending_targets.pop(0)
+            target_state = "IDLE"
+            filtered_x = None
+
+            print()
+            print(
+                f"[SEQUENCE] Advancing to "
+                f"x={target_x}, y={target_y} "
+                f"({len(pending_targets)} remaining)"
+            )
+
+        else:
+
+            target_state = "SETTLED"
+            settled_since = time.monotonic()
+
+            if sequence_running:
+                sequence_running = False
+                print()
+                print("[SEQUENCE] Complete -- all targets reached")
 
     try:
 
@@ -778,7 +820,7 @@ def main():
                 continue
 
             # ------------------------------------------------
-            # Laser detection (original implementation)
+            # Laser detection
             # ------------------------------------------------
 
             (
@@ -791,7 +833,6 @@ def main():
 
             error_x = None
             correction = None
-            ease = None
             jitter_offset = None
 
             if target_x is not None:
@@ -801,7 +842,7 @@ def main():
 
                 # TRACKING always re-evaluates. SETTLED also
                 # re-evaluates, but only once SETTLE_GRACE_PERIOD_S
-                # has passed since settling — see the constant's
+                # has passed since settling -- see the constant's
                 # comment for why the grace period exists.
 
                 settled_grace_elapsed = (
@@ -810,12 +851,14 @@ def main():
                     or time.monotonic() - settled_since >= SETTLE_GRACE_PERIOD_S
                 )
 
-                if (
+                can_update = (
                     target_state in ("TRACKING", "SETTLED")
                     and settled_grace_elapsed
                     and laser_x is not None
                     and time.monotonic() - last_servo_update >= SERVO_UPDATE_INTERVAL
-                ):
+                )
+
+                if can_update:
 
                     filtered_x = (
                         laser_x if filtered_x is None
@@ -824,54 +867,45 @@ def main():
 
                     error_x = target_x - filtered_x
 
-                    if abs(error_x) <= PIXEL_DEADBAND:
+                    if target_state == "SETTLED":
 
-                        tracking = False
+                        if abs(error_x) > RETRACK_DEADBAND_PX:
+                            # Drifted far enough to resume tracking.
+                            target_state = "TRACKING"
+                        # else: still within the looser retrack band --
+                        # hold still, no correction below.
 
-                        if target_state == "TRACKING":
-                            # Just arrived — enter jitter/settle.
-                            target_state = "JITTERING" if JITTER_ENABLE else "SETTLED"
-                            jitter_start_time = time.monotonic()
-                            jitter_base_pulse = pulse_us
-                            settled_since = time.monotonic()
-                        # else: already SETTLED and still within
-                        # deadband — stay put, nothing to do.
+                    if target_state == "TRACKING":
 
-                    else:
+                        if abs(error_x) <= SETTLE_DEADBAND_PX:
 
-                        # Either actively tracking, or drifted back
-                        # out of the deadband while SETTLED — in
-                        # both cases, (re)apply a correction.
+                            tracking = False
 
-                        tracking = True
-                        target_state = "TRACKING"
+                            if JITTER_ENABLE:
+                                target_state = "JITTERING"
+                                jitter_start_time = time.monotonic()
+                                jitter_base_pulse = pulse_us
+                            else:
+                                advance_or_settle()
 
-                        grad = error_x
-                        adam_t += 1
-                        adam_m = ADAM_BETA1 * adam_m + (1 - ADAM_BETA1) * grad
-                        adam_v = ADAM_BETA2 * adam_v + (1 - ADAM_BETA2) * (grad ** 2)
+                        else:
 
-                        m_hat = adam_m / (1 - ADAM_BETA1 ** adam_t)
-                        v_hat = adam_v / (1 - ADAM_BETA2 ** adam_t)
+                            tracking = True
 
-                        adam_step = ADAM_LR * m_hat / (math.sqrt(v_hat) + ADAM_EPS)
+                            desired = error_x * GAIN_US_PER_PX
 
-                        ease = min(1.0, abs(error_x) / EASE_DISTANCE_PX)
+                            correction = max(
+                                -MAX_STEP_US,
+                                min(MAX_STEP_US, desired)
+                            )
 
-                        correction = -adam_step * ease
+                            pulse_us -= correction
+                            pulse_us = max(
+                                MIN_PULSE_US,
+                                min(MAX_PULSE_US, pulse_us)
+                            )
 
-                        correction = max(
-                            -MAX_STEP_US,
-                            min(MAX_STEP_US, correction)
-                        )
-
-                        pulse_us += correction
-                        pulse_us = max(
-                            MIN_PULSE_US,
-                            min(MAX_PULSE_US, pulse_us)
-                        )
-
-                        set_pulse_us(pulse_us)
+                            set_pulse_us(pulse_us)
 
                     last_servo_update = time.monotonic()
 
@@ -879,7 +913,7 @@ def main():
 
                     # Jitter is a deliberate motion, independent of
                     # whether the laser happens to be detected this
-                    # exact frame — it doesn't need laser_x.
+                    # exact frame -- it doesn't need laser_x.
 
                     elapsed = time.monotonic() - jitter_start_time
 
@@ -888,33 +922,7 @@ def main():
                         pulse_us = jitter_base_pulse
                         set_pulse_us(pulse_us)
 
-                        if sequence_running and pending_targets:
-
-                            # Advance to the next queued target.
-
-                            target_x, target_y = pending_targets.pop(0)
-                            target_state = "IDLE"
-                            filtered_x = None
-                            adam_m = 0.0
-                            adam_v = 0.0
-                            adam_t = 0
-
-                            print()
-                            print(
-                                f"[SEQUENCE] Advancing to "
-                                f"x={target_x}, y={target_y} "
-                                f"({len(pending_targets)} remaining)"
-                            )
-
-                        else:
-
-                            target_state = "SETTLED"
-                            settled_since = time.monotonic()
-
-                            if sequence_running:
-                                sequence_running = False
-                                print()
-                                print("[SEQUENCE] Complete — all targets reached")
+                        advance_or_settle()
 
                     else:
 
@@ -937,7 +945,8 @@ def main():
                         set_pulse_us(jitter_pulse)
                         pulse_us = jitter_pulse
 
-                # SETTLED: nothing to do — servo holds still.
+                # SETTLED (within the retrack band): nothing to do --
+                # servo holds still, no re-actuation, no oscillation.
 
             # ------------------------------------------------
             # Output image
@@ -953,7 +962,7 @@ def main():
                 status = "LASER NOT DETECTED"
                 status_color = (0, 0, 255)
             elif target_x is None and pending_targets:
-                status = f"{len(pending_targets)} QUEUED — PRESS G TO GO"
+                status = f"{len(pending_targets)} QUEUED -- PRESS G TO GO"
                 status_color = (0, 165, 255)
             elif target_x is None:
                 status = "CLICK TO QUEUE TARGET(S)"
@@ -1028,7 +1037,7 @@ def main():
                 video_writer.write(combined)
 
             # ------------------------------------------------
-            # Logging (original — untouched)
+            # Logging (original -- untouched)
             # ------------------------------------------------
 
             log_data(
@@ -1037,7 +1046,7 @@ def main():
             )
 
             # ------------------------------------------------
-            # Logging (new — extra diagnostic log)
+            # Logging (extra diagnostic log)
             # ------------------------------------------------
 
             log_extra_data({
@@ -1050,10 +1059,6 @@ def main():
                 "laser_y": laser_y,
                 "filtered_x": filtered_x,
                 "error_x": error_x,
-                "adam_m": adam_m,
-                "adam_v": adam_v,
-                "adam_step": (correction / -ease) if (correction is not None and ease) else None,
-                "ease_factor": ease,
                 "correction_us": correction,
                 "pulse_us": pulse_us,
                 "jitter_offset_us": jitter_offset,
@@ -1076,13 +1081,10 @@ def main():
                     target_x, target_y = pending_targets.pop(0)
                     target_state = "IDLE"
                     filtered_x = None
-                    adam_m = 0.0
-                    adam_v = 0.0
-                    adam_t = 0
 
                     print()
                     print(
-                        f"[SEQUENCE] Starting — "
+                        f"[SEQUENCE] Starting -- "
                         f"x={target_x}, y={target_y} "
                         f"({len(pending_targets)} remaining)"
                     )
@@ -1095,7 +1097,7 @@ def main():
                 else:
 
                     print()
-                    print("[SEQUENCE] No queued targets — click to add some first")
+                    print("[SEQUENCE] No queued targets -- click to add some first")
 
             elif key == ord("r"):
 
@@ -1106,9 +1108,6 @@ def main():
                 target_y = None
                 target_state = "IDLE"
                 tracking = False
-                adam_m = 0.0
-                adam_v = 0.0
-                adam_t = 0
                 filtered_x = None
                 pending_targets = []
                 sequence_running = False
@@ -1123,9 +1122,6 @@ def main():
                 target_y = None
                 target_state = "IDLE"
                 tracking = False
-                adam_m = 0.0
-                adam_v = 0.0
-                adam_t = 0
                 filtered_x = None
                 pending_targets = []
                 sequence_running = False

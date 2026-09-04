@@ -10,9 +10,9 @@ import curses
 SERVO_PIN = 32
 
 HOME_ANGLE = 90       # Starting position
-LIMIT = 45            # +/- 30 degrees from home
+LIMIT = 90            # +/- 30 degrees from home
 
-STEP = 10              # Degrees per key press
+STEP = 1              # Degrees per key press
 
 RETURN_ANGLE = 0
 
