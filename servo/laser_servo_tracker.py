@@ -48,12 +48,12 @@ NEUTRAL_PULSE_US = 1500
 # LASER DETECTION
 # ============================================================
 
-BRIGHTNESS_MIN = 230
+BRIGHTNESS_MIN = 240
 BRIGHTNESS_MAX = 255
 
-MORPH_KERNEL_SIZE = 3
+MORPH_KERNEL_SIZE = 5
 
-MIN_BLOB_AREA = 6
+MIN_BLOB_AREA = 10
 
 # ============================================================
 # CONTROL
@@ -65,7 +65,7 @@ SERVO_UPDATE_INTERVAL = 0.05
 # "stepped" at ~12.5 updates/sec). Speed and slow-down now
 # come from GAIN_US_PER_PX / MAX_STEP_US below.
 
-ALPHA = 0.25
+ALPHA = 0.40
 # EMA smoothing factor on the laser x position used for
 # error calculation. Lower = smoother but laggier.
 
@@ -104,18 +104,35 @@ MAX_STEP_US = 25
 # proportionality is what prevents overshoot on the way in, not
 # this cap.
 
-SETTLE_DEADBAND_PX = 5
+SETTLE_DEADBAND_PX = 2
 # Error must be within this many px to be considered "reached"
 # and enter SETTLED. Kept tight for precision -- with a P-
 # controller (not a fixed step), getting this close does not
 # cause oscillation the way the old fixed-step approach did.
 
-RETRACK_DEADBAND_PX = 20
+RETRACK_DEADBAND_PX = 10
 # Once SETTLED, the laser must drift out past THIS looser
 # threshold before correction resumes. This hysteresis gap
 # between SETTLE_DEADBAND_PX and RETRACK_DEADBAND_PX stops
 # detection noise right at the settle boundary from repeatedly
 # flapping the state back into TRACKING.
+
+LASER_LOST_GRACE_S = 0.3
+# How long the laser can go undetected before we treat it as
+# "off the edge of the frame" and start actively recovering,
+# rather than just freezing the servo in place. A short value
+# (a frame or two) is normal detection noise and shouldn't
+# trigger this -- keep it above a few frame periods.
+
+RECOVERY_STEP_US = 15
+# How fast (us per frame) to sweep the pulse back toward
+# NEUTRAL_PULSE_US while the laser is missing. Neutral is used
+# as the recovery target because, for this rig, it's roughly
+# where the camera's field of view is centered -- so sweeping
+# back toward it is the best generic way to bring an
+# off-frame laser back into view without knowing exactly which
+# edge it left from. Recovery stops the instant the laser is
+# seen again, wherever that is.
 
 
 # --------------------------------------------------------
@@ -127,7 +144,7 @@ RETRACK_DEADBAND_PX = 20
 
 JITTER_ENABLE = True
 
-JITTER_AMPLITUDE_US = 35
+JITTER_AMPLITUDE_US = 30
 # How far (in us) the jitter swings from the settled pulse.
 # Larger = more visible/aggressive wiggle.
 
@@ -135,7 +152,19 @@ JITTER_DURATION_S = 3
 # How long (seconds) to jitter after reaching target.
 
 JITTER_FREQUENCY_HZ = 5.0
-# Speed of the sinusoidal component of the jitter.
+# Speed of the sinusoidal component of the jitter. IMPORTANT: this is
+# only sampled once per real loop iteration, so it needs the loop
+# running well above 2x this frequency (Nyquist) to actually look
+# like a smooth wiggle -- ideally 5-10x+ for it to look clean.
+# Your last two runs measured ~11.6fps then ~15.3fps (check the extra
+# log's timestamp deltas to see your current number -- video encoding
+# is the main remaining cost, see VIDEO_WRITE_EVERY_N above). At
+# 15.3fps, 5Hz was only ~3x oversampled -- right at the aliasing edge,
+# which produces a slow drifting "beat" pattern instead of a clean
+# wiggle. 2Hz gives ~7.5x oversampling at that same fps and should
+# look clean. If you later get the loop closer to 60fps, feel free to
+# raise this back toward 5Hz (keep it under roughly fps/5 as a rule
+# of thumb).
 
 JITTER_RANDOMNESS = 0.0
 # Blend between smooth sine motion (0.0) and pure random
@@ -180,6 +209,18 @@ VIDEO_FILE = os.path.join(
 )
 
 video_writer = None
+
+VIDEO_WRITE_EVERY_N = 1
+# Write every Nth frame to the output video instead of every frame.
+# Encoding a full side-by-side (2x width) frame with mp4v every
+# iteration is the other prime suspect (alongside the per-frame log
+# flush fixed above) for the ~11.6fps loop your log shows, against a
+# nominal 60fps camera. To isolate it: temporarily set this to 3-5,
+# re-run, and check the frame dt in the extra log the same way -- if
+# the fps jumps back up close to 60, the video encode is the
+# bottleneck, and it's worth moving to a hardware encoder (e.g. via
+# GStreamer) or a background writer thread rather than skipping
+# frames permanently.
 
 
 def setup_video_writer(width, height, fps):
@@ -268,7 +309,12 @@ def log_data(
         tracking
     ])
 
-    log_file.flush()
+    # Flushing (fsync-like disk I/O) every single frame was costing
+    # real time on every loop iteration -- flush periodically instead.
+    # The finally block still flushes+closes on a normal exit, so you
+    # only risk losing the last <0.5s of rows on a hard crash.
+    if frame_number % 30 == 0:
+        log_file.flush()
 
 
 # ============================================================
@@ -335,7 +381,9 @@ def log_extra_data(values):
 
     extra_csv_writer.writerow(row)
 
-    extra_log_file.flush()
+    # See the matching comment in log_data() -- same fix, same reason.
+    if values.get("frame", 0) % 30 == 0:
+        extra_log_file.flush()
 
 
 # ============================================================
@@ -365,6 +413,8 @@ def get_tunable_params():
         "MAX_STEP_US": MAX_STEP_US,
         "SETTLE_DEADBAND_PX": SETTLE_DEADBAND_PX,
         "RETRACK_DEADBAND_PX": RETRACK_DEADBAND_PX,
+        "LASER_LOST_GRACE_S": LASER_LOST_GRACE_S,
+        "RECOVERY_STEP_US": RECOVERY_STEP_US,
         "JITTER_ENABLE": JITTER_ENABLE,
         "JITTER_AMPLITUDE_US": JITTER_AMPLITUDE_US,
         "JITTER_DURATION_S": JITTER_DURATION_S,
@@ -375,6 +425,7 @@ def get_tunable_params():
         "MAX_PULSE_US": MAX_PULSE_US,
         "NEUTRAL_PULSE_US": NEUTRAL_PULSE_US,
         "PWM_FREQUENCY": PWM_FREQUENCY,
+        "VIDEO_WRITE_EVERY_N": VIDEO_WRITE_EVERY_N,
     }
 
 
@@ -760,9 +811,15 @@ def main():
 
     filtered_x = None
 
+    laser_last_seen = None
+    # Timestamp the laser was last actually detected. Used to notice
+    # when it's gone missing long enough to mean "off the edge of
+    # the frame" rather than a one-frame detection blip.
+
     jitter_start_time = None
     jitter_base_pulse = None
     settled_since = None
+    target_center_pulse = None
 
     # --------------------------------------------------------
     # Reaching a target either advances to the next queued
@@ -837,6 +894,36 @@ def main():
 
             if target_x is not None:
 
+                if laser_x is not None:
+                    laser_last_seen = time.monotonic()
+
+                if (
+                    target_state != "SEARCHING"
+                    and laser_last_seen is not None
+                    and time.monotonic() - laser_last_seen >= LASER_LOST_GRACE_S
+                ):
+                    target_state = "SEARCHING"
+                    print()
+                    print("[RECOVERY] Laser lost -- sweeping back toward neutral")
+
+                if target_state == "SEARCHING":
+
+                    if laser_x is not None:
+                        # Found it again -- resume normal tracking
+                        # from here, wherever "here" turned out to be.
+                        target_state = "TRACKING"
+                        filtered_x = None
+                    else:
+                        if pulse_us > NEUTRAL_PULSE_US:
+                            pulse_us = max(
+                                NEUTRAL_PULSE_US, pulse_us - RECOVERY_STEP_US
+                            )
+                        elif pulse_us < NEUTRAL_PULSE_US:
+                            pulse_us = min(
+                                NEUTRAL_PULSE_US, pulse_us + RECOVERY_STEP_US
+                            )
+                        set_pulse_us(pulse_us)
+
                 if target_state == "IDLE" and laser_x is not None:
                     target_state = "TRACKING"
 
@@ -880,6 +967,24 @@ def main():
                         if abs(error_x) <= SETTLE_DEADBAND_PX:
 
                             tracking = False
+
+                            # One last small correction to close the
+                            # remaining (sub-deadband) error before
+                            # freezing/jittering, so the jitter/settle
+                            # center is the best estimate of the true
+                            # target pulse -- not just wherever the
+                            # P-controller happened to stop inside the
+                            # deadband.
+                            fine_correction = max(
+                                -MAX_STEP_US,
+                                min(MAX_STEP_US, error_x * GAIN_US_PER_PX)
+                            )
+                            pulse_us -= fine_correction
+                            pulse_us = max(
+                                MIN_PULSE_US,
+                                min(MAX_PULSE_US, pulse_us)
+                            )
+                            set_pulse_us(pulse_us)
 
                             if JITTER_ENABLE:
                                 target_state = "JITTERING"
@@ -958,7 +1063,10 @@ def main():
             draw_target(output, target_x, target_y, laser_x)
             draw_queue(output, pending_targets)
 
-            if laser_x is None:
+            if target_state == "SEARCHING":
+                status = "LASER LOST -- RECOVERING TOWARD NEUTRAL"
+                status_color = (0, 0, 255)
+            elif laser_x is None:
                 status = "LASER NOT DETECTED"
                 status_color = (0, 0, 255)
             elif target_x is None and pending_targets:
@@ -1032,7 +1140,7 @@ def main():
             cv2.imshow(WINDOW_NAME, output)
             cv2.imshow(RAW_WINDOW, frame)
 
-            if video_writer is not None:
+            if video_writer is not None and frame_number % VIDEO_WRITE_EVERY_N == 0:
                 combined = np.hstack((output, frame))
                 video_writer.write(combined)
 
@@ -1138,10 +1246,21 @@ def main():
         try:
             set_pulse_us(NEUTRAL_PULSE_US)
             time.sleep(0.5)
+            print("Disabling PWM...")
+            stop_pwm()
         except Exception as e:
             print(f"Could not return to neutral: {e}")
 
-        stop_pwm()
+        # Deliberately NOT calling stop_pwm() here. Disabling the PWM
+        # channel cuts the signal entirely, and most servos only hold
+        # a position while they're actively receiving pulses -- once
+        # the signal stops, they go limp and can drift away from
+        # neutral under their own mechanical load (gravity, cable
+        # drag, an off-balance mount, etc). Leaving the channel
+        # enabled at NEUTRAL_PULSE_US keeps it actively parked there
+        # after the script exits. Call stop_pwm() manually if you
+        # ever want to fully power down the channel instead.
+
         cap.release()
         cv2.destroyAllWindows()
 
