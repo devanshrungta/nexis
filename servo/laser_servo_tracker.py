@@ -7,6 +7,7 @@ import os
 import csv
 import math
 import random
+import Jetson.GPIO as GPIO
 from datetime import datetime
 
 
@@ -94,9 +95,38 @@ GAIN_US_PER_PX = 0.025
 # slightly BELOW) the real system response -- i.e. how many us
 # it actually takes to move the laser 1px. Set too high, it can
 # still overshoot despite the clamp; set too low, it just takes
-# a few extra frames to converge. Tune by watching the "X Error"
+# a few extra frames to converge. Tune by watching the "Error"
 # overlay: if it overshoots past zero, lower this; if it's
 # sluggish on small errors, raise it.
+
+CONTROL_AXIS = "x"
+# Which pixel axis this single servo currently follows: "x"
+# (default) or "y". Toggle live with the A key. You don't need
+# to re-click or re-queue targets when you switch -- every
+# clicked target already stores both its x and y (from the
+# original click), so switching axis just changes which
+# coordinate of the SAME target(s) the control loop reads.
+
+AXIS_GAIN_US_PER_PX = {
+    "x": GAIN_US_PER_PX,
+    "y": GAIN_US_PER_PX,
+    # ^ Y starts as a copy of your tuned X gain as a starting
+    # point only -- the physical response per pixel is not
+    # guaranteed to match between axes (different lever arm,
+    # different mount geometry, etc). Tune this independently
+    # once you've actually tested the Y axis, the same way you
+    # tuned GAIN_US_PER_PX for X.
+}
+
+AXIS_SIGN = {
+    "x": -1,
+    "y": -1,
+    # ^ x=-1 matches your existing `pulse_us -= correction`
+    # convention. Flip y to +1 if increasing pulse_us needs to
+    # move the laser in the opposite direction on that axis --
+    # you'll see it immediately as the laser moving away from
+    # the target instead of toward it when you first test Y.
+}
 
 MAX_STEP_US = 25
 # Hard cap on any single correction (top speed for large
@@ -338,6 +368,7 @@ EXTRA_LOG_FIELDS = [
     "frame",
     "status_text",
     "target_state",
+    "control_axis",
     "sequence_running",
     "queue_remaining",
     "laser_x",
@@ -347,6 +378,10 @@ EXTRA_LOG_FIELDS = [
     "correction_us",
     "pulse_us",
     "jitter_offset_us",
+    "actuator_axis",
+    "actuator_state",
+    "actuator_error",
+    "actuator_position",
 ]
 
 
@@ -409,7 +444,12 @@ def get_tunable_params():
         "MIN_BLOB_AREA": MIN_BLOB_AREA,
         "SERVO_UPDATE_INTERVAL": SERVO_UPDATE_INTERVAL,
         "ALPHA": ALPHA,
+        "CONTROL_AXIS": CONTROL_AXIS,
         "GAIN_US_PER_PX": GAIN_US_PER_PX,
+        "AXIS_GAIN_US_PER_PX_X": AXIS_GAIN_US_PER_PX["x"],
+        "AXIS_GAIN_US_PER_PX_Y": AXIS_GAIN_US_PER_PX["y"],
+        "AXIS_SIGN_X": AXIS_SIGN["x"],
+        "AXIS_SIGN_Y": AXIS_SIGN["y"],
         "MAX_STEP_US": MAX_STEP_US,
         "SETTLE_DEADBAND_PX": SETTLE_DEADBAND_PX,
         "RETRACK_DEADBAND_PX": RETRACK_DEADBAND_PX,
@@ -426,6 +466,12 @@ def get_tunable_params():
         "NEUTRAL_PULSE_US": NEUTRAL_PULSE_US,
         "PWM_FREQUENCY": PWM_FREQUENCY,
         "VIDEO_WRITE_EVERY_N": VIDEO_WRITE_EVERY_N,
+        "ACT_STEP_DELAY_S": ACT_STEP_DELAY_S,
+        "ACT_GAIN_STEPS_PER_PX": ACT_GAIN_STEPS_PER_PX,
+        "ACT_SIGN": ACT_SIGN,
+        "ACT_MAX_STEPS_PER_FRAME": ACT_MAX_STEPS_PER_FRAME,
+        "ACT_SETTLE_DEADBAND_PX": ACT_SETTLE_DEADBAND_PX,
+        "ACT_RETRACK_DEADBAND_PX": ACT_RETRACK_DEADBAND_PX,
     }
 
 
@@ -520,6 +566,127 @@ def stop_pwm():
 
     except Exception:
         pass
+
+
+# ============================================================
+# LINEAR ACTUATOR (second DOF)
+#
+# Only the low-level step/dir/enable control is borrowed from
+# your fuyu_actuator.py (TMC2209-driven FUYU FPB30E500RB42) --
+# not its calibration/limit-switch homing, keyboard jog loop, or
+# acceleration ramps, none of which apply to closed-loop pixel
+# tracking the way the servo's own P-controller already works.
+#
+# This actuator always drives whichever axis the servo is NOT
+# currently on -- the complement of CONTROL_AXIS -- so the two
+# DOF together cover both X and Y every frame, automatically
+# following you if you press A to swap the servo's axis. The
+# servo's own code above this point is completely untouched.
+#
+# Important open-loop caveat, inherited as-is from your script:
+# there's no encoder or limit-switch feedback here, same as
+# fuyu_actuator.py with CALIBRATION_ENABLED = False. "Position"
+# below is just a step count from wherever the actuator happened
+# to be when this script started -- not a calibrated absolute
+# position. Step 0 is used as this axis's "home"/neutral, the
+# same role NEUTRAL_PULSE_US plays for the servo.
+# ============================================================
+
+ACT_STEP_PIN = 29
+ACT_DIR_PIN = 31
+ACT_EN_PIN = 33
+# Same physical (BOARD) pin numbers as fuyu_actuator.py.
+
+ACT_STEP_DELAY_S = 0.0007
+# Half-period of the STEP pulse (seconds) -- HIGH for this long,
+# then LOW for this long, per step (~714 steps/sec). A
+# conservative starting point in the neighborhood of
+# fuyu_actuator.py's MANUAL_START_SPEED (500 steps/s). Lower
+# this once you've confirmed it doesn't skip steps faster.
+
+ACT_GAIN_STEPS_PER_PX = 0.5
+# Steps of correction per pixel of remaining error on this
+# actuator's axis. PLACEHOLDER -- unlike GAIN_US_PER_PX for the
+# servo, this has never been tuned against real hardware. Tune
+# it exactly the same way: watch this axis's error overlay, lower
+# the gain if it overshoots, raise it if it's sluggish.
+
+ACT_SIGN = -1
+# +1 or -1. PLACEHOLDER -- flip this if the actuator moves away
+# from the target instead of toward it the first time you test it.
+
+ACT_MAX_STEPS_PER_FRAME = 20
+# Hard cap on steps issued in a single frame. Each step blocks
+# for 2 * ACT_STEP_DELAY_S, so this also bounds how long one
+# frame can spend pulsing the actuator -- at the defaults above,
+# 20 * 2 * 0.0007s = 28ms worst case, which is a real chunk of a
+# 16.7ms (60fps) budget on its own. Watch your achieved fps once
+# this is live (same timestamp-delta check you've been using) and
+# lower this (or ACT_STEP_DELAY_S) if the actuator is visibly
+# costing you frame rate, the same way VIDEO_WRITE_EVERY_N was
+# needed for the video encode.
+
+ACT_SETTLE_DEADBAND_PX = SETTLE_DEADBAND_PX
+ACT_RETRACK_DEADBAND_PX = RETRACK_DEADBAND_PX
+# Start as copies of the servo's hysteresis thresholds. The
+# actuator's real positioning resolution/backlash hasn't been
+# characterized -- tune these independently once it has.
+
+GPIO.setmode(GPIO.BOARD)
+
+GPIO.setup(ACT_STEP_PIN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(ACT_DIR_PIN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(ACT_EN_PIN, GPIO.OUT, initial=GPIO.HIGH)
+
+
+def act_enable():
+
+    # TMC2209 EN is active LOW -- same convention as
+    # fuyu_actuator.py's enable_motor().
+
+    GPIO.output(ACT_EN_PIN, GPIO.LOW)
+
+
+def act_disable():
+
+    GPIO.output(ACT_EN_PIN, GPIO.HIGH)
+
+
+def act_set_direction(direction):
+
+    GPIO.output(
+        ACT_DIR_PIN,
+        GPIO.HIGH if direction > 0 else GPIO.LOW
+    )
+
+    time.sleep(0.00001)
+    # Matches fuyu_actuator.py's DIR_SETUP_TIME -- lets the DIR
+    # signal settle before the first STEP pulse.
+
+
+def act_step_once():
+
+    GPIO.output(ACT_STEP_PIN, GPIO.HIGH)
+    time.sleep(ACT_STEP_DELAY_S)
+
+    GPIO.output(ACT_STEP_PIN, GPIO.LOW)
+    time.sleep(ACT_STEP_DELAY_S)
+
+
+def act_move_steps(n_steps, direction):
+
+    # Blocking -- issues n_steps STEP pulses right away. Callers
+    # keep n_steps within ACT_MAX_STEPS_PER_FRAME so this can
+    # only block for one frame's worth of time at most.
+
+    if n_steps <= 0:
+        return
+
+    act_set_direction(direction)
+    act_enable()
+
+    for _ in range(n_steps):
+        act_step_once()
 
 
 # ============================================================
@@ -743,6 +910,7 @@ def main():
     global target_state
     global pending_targets
     global sequence_running
+    global CONTROL_AXIS
 
     cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
 
@@ -767,20 +935,26 @@ def main():
     print(f"Resolution   : {FRAME_WIDTH}x{FRAME_HEIGHT}")
     print(f"PWM          : {PWM_PATH}")
     print(f"Pulse range  : {MIN_PULSE_US}-{MAX_PULSE_US} us")
+    print(f"Actuator pins: STEP={ACT_STEP_PIN} DIR={ACT_DIR_PIN} EN={ACT_EN_PIN}")
     print()
     print("CONTROLS")
     print("  Left click  = queue a target")
     print("  G           = go -- start tracking the queued targets in order")
+    print("  A           = switch servo's control axis (X <-> Y) --")
+    print("                the actuator automatically follows the other axis")
     print("  R           = neutral (also clears queue)")
     print("  C           = cancel current target / sequence / queue")
     print("  Q           = quit")
     print()
+    print(f"Starting axis  : servo={CONTROL_AXIS.upper()}  "
+          f"actuator={('y' if CONTROL_AXIS == 'x' else 'x').upper()}")
     print(f"Log file       : {LOG_FILE}")
     print(f"Extra log file : {EXTRA_LOG_FILE}")
     print(f"Params file    : {PARAMS_LOG_FILE}")
     print()
 
     setup_pwm()
+    act_enable()
 
     pulse_us = float(NEUTRAL_PULSE_US)
 
@@ -820,6 +994,22 @@ def main():
     jitter_base_pulse = None
     settled_since = None
     target_center_pulse = None
+
+    actuator_position = 0
+    # Step count relative to wherever the actuator happened to be
+    # when this script started -- see the caveat in the LINEAR
+    # ACTUATOR section above. Used as this axis's own "home".
+
+    actuator_filtered = None
+    actuator_state = "IDLE"
+    # One of: IDLE, TRACKING, SETTLED. No JITTERING of its own --
+    # jitter wasn't asked for on this axis and rapid direction
+    # reversals are harder on a leadscrew/stepper than a hobby
+    # servo, so it's deliberately left out for now. Laser-lost
+    # recovery IS shared with the servo, via the existing
+    # target_state == "SEARCHING" check below -- that condition
+    # (is the laser visible at all) isn't axis-specific, so this
+    # reads it without needing to touch how the servo sets it.
 
     # --------------------------------------------------------
     # Reaching a target either advances to the next queued
@@ -947,12 +1137,17 @@ def main():
 
                 if can_update:
 
+                    # Which coordinate of the laser/target this
+                    # single servo is currently following.
+                    laser_pos = laser_x if CONTROL_AXIS == "x" else laser_y
+                    target_pos = target_x if CONTROL_AXIS == "x" else target_y
+
                     filtered_x = (
-                        laser_x if filtered_x is None
-                        else ALPHA * laser_x + (1 - ALPHA) * filtered_x
+                        laser_pos if filtered_x is None
+                        else ALPHA * laser_pos + (1 - ALPHA) * filtered_x
                     )
 
-                    error_x = target_x - filtered_x
+                    error_x = target_pos - filtered_x
 
                     if target_state == "SETTLED":
 
@@ -977,9 +1172,12 @@ def main():
                             # deadband.
                             fine_correction = max(
                                 -MAX_STEP_US,
-                                min(MAX_STEP_US, error_x * GAIN_US_PER_PX)
+                                min(
+                                    MAX_STEP_US,
+                                    error_x * AXIS_GAIN_US_PER_PX[CONTROL_AXIS]
+                                )
                             )
-                            pulse_us -= fine_correction
+                            pulse_us += AXIS_SIGN[CONTROL_AXIS] * fine_correction
                             pulse_us = max(
                                 MIN_PULSE_US,
                                 min(MAX_PULSE_US, pulse_us)
@@ -997,14 +1195,14 @@ def main():
 
                             tracking = True
 
-                            desired = error_x * GAIN_US_PER_PX
+                            desired = error_x * AXIS_GAIN_US_PER_PX[CONTROL_AXIS]
 
                             correction = max(
                                 -MAX_STEP_US,
                                 min(MAX_STEP_US, desired)
                             )
 
-                            pulse_us -= correction
+                            pulse_us += AXIS_SIGN[CONTROL_AXIS] * correction
                             pulse_us = max(
                                 MIN_PULSE_US,
                                 min(MAX_PULSE_US, pulse_us)
@@ -1052,6 +1250,96 @@ def main():
 
                 # SETTLED (within the retrack band): nothing to do --
                 # servo holds still, no re-actuation, no oscillation.
+
+            # ------------------------------------------------
+            # Actuator control (second DOF)
+            #
+            # Fully independent of the servo block above -- own
+            # state variable, own error, own deadbands. Drives
+            # whichever axis CONTROL_AXIS is NOT currently on.
+            # ------------------------------------------------
+
+            actuator_error = None
+            actuator_correction = None
+
+            if target_x is not None:
+
+                actuator_axis = "y" if CONTROL_AXIS == "x" else "x"
+                actuator_laser_pos = laser_x if actuator_axis == "x" else laser_y
+                actuator_target_pos = target_x if actuator_axis == "x" else target_y
+
+                if target_state == "SEARCHING":
+
+                    # Shares the servo's laser-lost trigger (that
+                    # condition is "is the laser visible at all",
+                    # not axis-specific) -- sweep this axis back
+                    # toward its own home (step 0) too.
+
+                    if actuator_position > 0:
+                        step_this_frame = min(
+                            ACT_MAX_STEPS_PER_FRAME, actuator_position
+                        )
+                        act_move_steps(step_this_frame, -1)
+                        actuator_position -= step_this_frame
+
+                    elif actuator_position < 0:
+                        step_this_frame = min(
+                            ACT_MAX_STEPS_PER_FRAME, -actuator_position
+                        )
+                        act_move_steps(step_this_frame, +1)
+                        actuator_position += step_this_frame
+
+                    actuator_state = "IDLE"
+                    actuator_filtered = None
+
+                elif actuator_laser_pos is not None:
+
+                    if actuator_state == "IDLE":
+                        actuator_state = "TRACKING"
+
+                    actuator_filtered = (
+                        actuator_laser_pos if actuator_filtered is None
+                        else ALPHA * actuator_laser_pos
+                        + (1 - ALPHA) * actuator_filtered
+                    )
+
+                    actuator_error = actuator_target_pos - actuator_filtered
+
+                    if actuator_state == "SETTLED":
+
+                        if abs(actuator_error) > ACT_RETRACK_DEADBAND_PX:
+                            actuator_state = "TRACKING"
+
+                    if actuator_state == "TRACKING":
+
+                        if abs(actuator_error) <= ACT_SETTLE_DEADBAND_PX:
+
+                            actuator_state = "SETTLED"
+
+                        else:
+
+                            desired_steps = (
+                                actuator_error * ACT_GAIN_STEPS_PER_PX
+                            )
+
+                            actuator_correction = max(
+                                -ACT_MAX_STEPS_PER_FRAME,
+                                min(ACT_MAX_STEPS_PER_FRAME, desired_steps)
+                            )
+
+                            steps_this_frame = int(round(
+                                ACT_SIGN * actuator_correction
+                            ))
+
+                            if steps_this_frame != 0:
+
+                                direction = 1 if steps_this_frame > 0 else -1
+
+                                act_move_steps(
+                                    abs(steps_this_frame), direction
+                                )
+
+                                actuator_position += steps_this_frame
 
             # ------------------------------------------------
             # Output image
@@ -1118,8 +1406,28 @@ def main():
 
             if error_x is not None:
                 cv2.putText(
-                    output, f"X Error: {error_x:+.1f} px", (30, 185),
+                    output, f"{CONTROL_AXIS.upper()} Error: {error_x:+.1f} px", (30, 185),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
+                )
+
+            cv2.putText(
+                output, f"Axis: {CONTROL_AXIS.upper()}  (press A to switch)", (30, 290),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2
+            )
+
+            if target_x is not None:
+                actuator_axis_label = "y" if CONTROL_AXIS == "x" else "x"
+                act_status = (
+                    f"Actuator ({actuator_axis_label.upper()}): {actuator_state}"
+                    + (
+                        f"  err={actuator_error:+.1f}px"
+                        if actuator_error is not None else ""
+                    )
+                    + f"  pos={actuator_position}"
+                )
+                cv2.putText(
+                    output, act_status, (30, 320),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2
                 )
 
             fps_count += 1
@@ -1161,6 +1469,7 @@ def main():
                 "frame": frame_number,
                 "status_text": status,
                 "target_state": target_state,
+                "control_axis": CONTROL_AXIS,
                 "sequence_running": sequence_running,
                 "queue_remaining": len(pending_targets),
                 "laser_x": laser_x,
@@ -1170,6 +1479,10 @@ def main():
                 "correction_us": correction,
                 "pulse_us": pulse_us,
                 "jitter_offset_us": jitter_offset,
+                "actuator_axis": "y" if CONTROL_AXIS == "x" else "x",
+                "actuator_state": actuator_state,
+                "actuator_error": actuator_error,
+                "actuator_position": actuator_position,
             })
 
             # ------------------------------------------------
@@ -1206,6 +1519,24 @@ def main():
 
                     print()
                     print("[SEQUENCE] No queued targets -- click to add some first")
+
+            elif key == ord("a"):
+
+                CONTROL_AXIS = "y" if CONTROL_AXIS == "x" else "x"
+
+                # Reset in-flight control state only -- target_x/
+                # target_y, pending_targets, and sequence_running are
+                # left alone, since every queued point already has
+                # both coordinates and stays valid under either axis.
+                filtered_x = None
+                error_x = None
+
+                if target_x is not None:
+                    target_state = "IDLE"
+                    settled_since = None
+
+                print()
+                print(f"[AXIS] Switched control axis to {CONTROL_AXIS.upper()}")
 
             elif key == ord("r"):
 
@@ -1246,8 +1577,6 @@ def main():
         try:
             set_pulse_us(NEUTRAL_PULSE_US)
             time.sleep(0.5)
-            print("Disabling PWM...")
-            stop_pwm()
         except Exception as e:
             print(f"Could not return to neutral: {e}")
 
@@ -1260,6 +1589,26 @@ def main():
         # enabled at NEUTRAL_PULSE_US keeps it actively parked there
         # after the script exits. Call stop_pwm() manually if you
         # ever want to fully power down the channel instead.
+        # (A stop_pwm() call had crept back in here -- that's exactly
+        # what caused the "not returning to neutral" bug the first
+        # time around, so it's been removed again.)
+
+        # Actuator: disabling it here is the OPPOSITE choice from the
+        # servo above, on purpose. fuyu_actuator.py itself disables
+        # the motor on every exit path, including a clean quit -- and
+        # with no limit switches or calibration configured on this
+        # axis, holding current indefinitely on an unsupervised,
+        # unhomed stepper is a real thermal/mechanical risk that
+        # doesn't have a good equivalent on the hobby servo side. The
+        # tradeoff: this axis can drift once disabled, same failure
+        # mode as the servo bug, just accepted deliberately here. If
+        # you'd rather it hold position like the servo does, remove
+        # the act_disable() call below -- but note GPIO.cleanup()
+        # resets pin state on exit regardless, so holding position
+        # reliably after the script exits may need more than that;
+        # test it before relying on it.
+        act_disable()
+        GPIO.cleanup()
 
         cap.release()
         cv2.destroyAllWindows()
