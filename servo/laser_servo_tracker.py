@@ -44,6 +44,25 @@ MAX_PULSE_US = 2500
 
 NEUTRAL_PULSE_US = 1500
 
+SERVO_VISIBLE_MIN_PULSE_US = MIN_PULSE_US
+SERVO_VISIBLE_MAX_PULSE_US = MAX_PULSE_US
+# The pulse range within which the laser is ACTUALLY visible in
+# the camera's frame -- not necessarily the servo's full
+# mechanical range above, which is very likely wider than what
+# the camera can actually see. Defaults to the full range (no
+# behavior change) until you calibrate it: press R to go to
+# neutral, then manually drive the servo (e.g. quickest way --
+# temporarily click a target far off to one side and watch the
+# video feed) to find the pulse value where the laser JUST exits
+# frame on each side (read it off the "Pulse: ... us" overlay),
+# and set these two to just inside those points. Every place the
+# control loop below moves the servo clamps to THIS range, not
+# the full mechanical range -- so a bad correction (miscalibrated
+# gain, an edge case in the recovery sweep, anything) can't drive
+# the laser out of view even if it tries to. NEUTRAL_PULSE_US
+# above is left alone -- it's the servo's own rest position, used
+# only by R and on quit, not part of this visibility clamp.
+
 
 # ============================================================
 # LASER DETECTION
@@ -120,7 +139,7 @@ AXIS_GAIN_US_PER_PX = {
 
 AXIS_SIGN = {
     "x": -1,
-    "y": -1,
+    "y": 1,
     # ^ x=-1 matches your existing `pulse_us -= correction`
     # convention. Flip y to +1 if increasing pulse_us needs to
     # move the laser in the opposite direction on that axis --
@@ -128,7 +147,7 @@ AXIS_SIGN = {
     # the target instead of toward it when you first test Y.
 }
 
-MAX_STEP_US = 25
+MAX_STEP_US = 15
 # Hard cap on any single correction (top speed for large
 # errors). Raise this to close large gaps faster; the P-control
 # proportionality is what prevents overshoot on the way in, not
@@ -146,6 +165,16 @@ RETRACK_DEADBAND_PX = 10
 # between SETTLE_DEADBAND_PX and RETRACK_DEADBAND_PX stops
 # detection noise right at the settle boundary from repeatedly
 # flapping the state back into TRACKING.
+
+SETTLE_DWELL_S = 0.3
+# The error must stay continuously within SETTLE_DEADBAND_PX for
+# this long before the target is actually marked reached. Without
+# this, a fast-moving laser that merely crosses through the
+# deadband on its way past the target (e.g. from overshoot, or
+# while still converging) gets counted as "reached" on that one
+# lucky frame. Any frame the error goes back outside the deadband
+# resets the dwell clock -- see settle_dwell_start below. Shared
+# by both the servo and the actuator's own settle check.
 
 LASER_LOST_GRACE_S = 0.3
 # How long the laser can go undetected before we treat it as
@@ -453,6 +482,7 @@ def get_tunable_params():
         "MAX_STEP_US": MAX_STEP_US,
         "SETTLE_DEADBAND_PX": SETTLE_DEADBAND_PX,
         "RETRACK_DEADBAND_PX": RETRACK_DEADBAND_PX,
+        "SETTLE_DWELL_S": SETTLE_DWELL_S,
         "LASER_LOST_GRACE_S": LASER_LOST_GRACE_S,
         "RECOVERY_STEP_US": RECOVERY_STEP_US,
         "JITTER_ENABLE": JITTER_ENABLE,
@@ -464,9 +494,13 @@ def get_tunable_params():
         "MIN_PULSE_US": MIN_PULSE_US,
         "MAX_PULSE_US": MAX_PULSE_US,
         "NEUTRAL_PULSE_US": NEUTRAL_PULSE_US,
+        "SERVO_VISIBLE_MIN_PULSE_US": SERVO_VISIBLE_MIN_PULSE_US,
+        "SERVO_VISIBLE_MAX_PULSE_US": SERVO_VISIBLE_MAX_PULSE_US,
         "PWM_FREQUENCY": PWM_FREQUENCY,
         "VIDEO_WRITE_EVERY_N": VIDEO_WRITE_EVERY_N,
-        "ACT_STEP_DELAY_S": ACT_STEP_DELAY_S,
+        "ACT_MAX_SPEED_STEPS_S": ACT_MAX_SPEED_STEPS_S,
+        "ACT_ACCELERATION_STEPS_S2": ACT_ACCELERATION_STEPS_S2,
+        "ACT_RECOVERY_SPEED_STEPS_S": ACT_RECOVERY_SPEED_STEPS_S,
         "ACT_GAIN_STEPS_PER_PX": ACT_GAIN_STEPS_PER_PX,
         "ACT_SIGN": ACT_SIGN,
         "ACT_MAX_STEPS_PER_FRAME": ACT_MAX_STEPS_PER_FRAME,
@@ -597,34 +631,65 @@ ACT_DIR_PIN = 31
 ACT_EN_PIN = 33
 # Same physical (BOARD) pin numbers as fuyu_actuator.py.
 
-ACT_STEP_DELAY_S = 0.0007
-# Half-period of the STEP pulse (seconds) -- HIGH for this long,
-# then LOW for this long, per step (~714 steps/sec). A
-# conservative starting point in the neighborhood of
-# fuyu_actuator.py's MANUAL_START_SPEED (500 steps/s). Lower
-# this once you've confirmed it doesn't skip steps faster.
+ACT_MAX_SPEED_STEPS_S = 2000
+# Top cruising speed (steps/sec) when there's plenty of distance
+# left to cover. Actual speed each frame is acceleration-limited
+# below this -- it's never commanded instantly.
+
+ACT_ACCELERATION_STEPS_S2 = 1500
+# How fast speed is allowed to ramp up or down (steps/sec^2).
+# THIS is the actual fix for the vibration and the overshoot you
+# saw: the previous version jumped straight to a target step rate
+# every frame with no ramp, which is exactly the failure mode
+# that makes a stepper lose sync (miss steps) and vibrate/stall
+# instead of turning smoothly -- and once it's missing steps, the
+# software's step count stops matching reality, which is how it
+# can look like it "kept on moving" past the target. This value
+# is borrowed directly from fuyu_actuator.py's own
+# MANUAL_ACCELERATION, since that's an already-validated safe
+# ramp rate for this exact actuator.
+#
+# Each frame, actual speed moves toward the frame's target speed
+# by at most ACT_ACCELERATION_STEPS_S2 * dt (see actuator_speed
+# below) -- a proper trapezoidal motion profile: accelerate while
+# far away, then decelerate at exactly the rate needed to arrive
+# at zero remaining distance with zero speed (v = sqrt(2 * a * d),
+# the standard stopping-distance formula), rather than the
+# previous fixed-distance linear ramp, which had no actual
+# relationship to how fast the actuator could safely decelerate.
 
 ACT_GAIN_STEPS_PER_PX = 0.5
 # Steps of correction per pixel of remaining error on this
-# actuator's axis. PLACEHOLDER -- unlike GAIN_US_PER_PX for the
-# servo, this has never been tuned against real hardware. Tune
-# it exactly the same way: watch this axis's error overlay, lower
-# the gain if it overshoots, raise it if it's sluggish.
+# actuator's axis -- i.e. the calibration between pixels and
+# steps, used to estimate how many steps are left to close the
+# current gap (which the deceleration formula above needs).
+# PLACEHOLDER -- unlike GAIN_US_PER_PX for the servo, this has
+# never been tuned against real hardware. Tune it the same way:
+# watch this axis's error overlay, lower it if it overshoots,
+# raise it if it's sluggish.
 
 ACT_SIGN = -1
-# +1 or -1. PLACEHOLDER -- flip this if the actuator moves away
-# from the target instead of toward it the first time you test it.
+# +1 or -1. Flip this if the actuator moves away from the target
+# instead of toward it.
 
-ACT_MAX_STEPS_PER_FRAME = 20
-# Hard cap on steps issued in a single frame. Each step blocks
-# for 2 * ACT_STEP_DELAY_S, so this also bounds how long one
-# frame can spend pulsing the actuator -- at the defaults above,
-# 20 * 2 * 0.0007s = 28ms worst case, which is a real chunk of a
-# 16.7ms (60fps) budget on its own. Watch your achieved fps once
-# this is live (same timestamp-delta check you've been using) and
-# lower this (or ACT_STEP_DELAY_S) if the actuator is visibly
-# costing you frame rate, the same way VIDEO_WRITE_EVERY_N was
-# needed for the video encode.
+ACT_MAX_STEPS_PER_FRAME = 40
+# Hard safety cap on steps issued in a single frame, independent
+# of the speed profile above -- this bounds worst-case per-frame
+# blocking time regardless of what speed the ramp reaches. At
+# ACT_MAX_SPEED_STEPS_S, 40 steps blocks for about 2*40/2000 =
+# 40ms in the worst case -- watch your achieved fps once this is
+# live, the same way VIDEO_WRITE_EVERY_N was needed for the video
+# encode.
+
+ACT_RECOVERY_SPEED_STEPS_S = 400
+# Fixed (non-ramped) speed used only for the laser-lost recovery
+# sweep back toward home, not for normal tracking. Borrowed
+# directly from fuyu_actuator.py's MANUAL_START_SPEED (500) --
+# an already-validated speed this actuator can start at directly
+# without ramping, kept slightly under that as a margin. Recovery
+# bursts are short (capped by ACT_MAX_STEPS_PER_FRAME same as
+# everything else), so the full accel/decel treatment isn't
+# needed here.
 
 ACT_SETTLE_DEADBAND_PX = SETTLE_DEADBAND_PX
 ACT_RETRACK_DEADBAND_PX = RETRACK_DEADBAND_PX
@@ -664,16 +729,41 @@ def act_set_direction(direction):
     # signal settle before the first STEP pulse.
 
 
-def act_step_once():
+def act_step_once(delay):
 
     GPIO.output(ACT_STEP_PIN, GPIO.HIGH)
-    time.sleep(ACT_STEP_DELAY_S)
+    time.sleep(delay)
 
     GPIO.output(ACT_STEP_PIN, GPIO.LOW)
-    time.sleep(ACT_STEP_DELAY_S)
+    time.sleep(delay)
 
 
-def act_move_steps(n_steps, direction):
+def act_target_speed(remaining_steps):
+
+    # Standard trapezoidal-motion-profile stopping-distance
+    # formula: to come to a stop exactly at zero remaining
+    # distance under a fixed deceleration `a`, current speed must
+    # not exceed sqrt(2 * a * distance). Below this, the speed
+    # ramp toward it (actuator_speed, applied per-frame where this
+    # is called) naturally decelerates at the right rate instead
+    # of slamming into ACT_SETTLE_DEADBAND_PX at full speed.
+
+    stopping_speed = math.sqrt(
+        2 * ACT_ACCELERATION_STEPS_S2 * max(0.0, remaining_steps)
+    )
+
+    return min(ACT_MAX_SPEED_STEPS_S, stopping_speed)
+
+
+def act_delay_from_speed(speed_steps_s):
+
+    if speed_steps_s <= 0:
+        return None
+
+    return 1.0 / (2.0 * speed_steps_s)
+
+
+def act_move_steps(n_steps, direction, delay):
 
     # Blocking -- issues n_steps STEP pulses right away. Callers
     # keep n_steps within ACT_MAX_STEPS_PER_FRAME so this can
@@ -686,7 +776,7 @@ def act_move_steps(n_steps, direction):
     act_enable()
 
     for _ in range(n_steps):
-        act_step_once()
+        act_step_once(delay)
 
 
 # ============================================================
@@ -995,6 +1085,13 @@ def main():
     settled_since = None
     target_center_pulse = None
 
+    settle_dwell_start = None
+    # When the servo's error first entered SETTLE_DEADBAND_PX,
+    # continuously. Reset to None any time the error leaves the
+    # deadband. Reaching SETTLE_DWELL_S after this timestamp is
+    # required (alongside the actuator also being SETTLED) before
+    # the target actually counts as reached.
+
     actuator_position = 0
     # Step count relative to wherever the actuator happened to be
     # when this script started -- see the caveat in the LINEAR
@@ -1010,6 +1107,25 @@ def main():
     # target_state == "SEARCHING" check below -- that condition
     # (is the laser visible at all) isn't axis-specific, so this
     # reads it without needing to touch how the servo sets it.
+
+    actuator_settle_dwell_start = None
+    # Same dwell-timer idea as settle_dwell_start above, but for
+    # the actuator's own axis.
+
+    actuator_speed = 0.0
+    # Current commanded speed (steps/sec), persisted across frames
+    # and ramped toward each frame's target speed by at most
+    # ACT_ACCELERATION_STEPS_S2 * dt -- see act_target_speed().
+    # Reset to 0 any time the actuator isn't actively correcting
+    # (it isn't physically moving then, so there's no real speed
+    # to carry over) and on a direction reversal (must pass
+    # through zero speed before turning around).
+
+    actuator_last_direction = 0
+    actuator_last_update = None
+    # Wall-clock time of the last actuator update, used to get a
+    # real dt for the speed ramp above rather than assuming a
+    # fixed frame time (your loop's fps isn't constant).
 
     # --------------------------------------------------------
     # Reaching a target either advances to the next queued
@@ -1094,7 +1210,7 @@ def main():
                 ):
                     target_state = "SEARCHING"
                     print()
-                    print("[RECOVERY] Laser lost -- sweeping back toward neutral")
+                    print("[RECOVERY] Laser lost -- sweeping back toward frame center")
 
                 if target_state == "SEARCHING":
 
@@ -1103,14 +1219,27 @@ def main():
                         # from here, wherever "here" turned out to be.
                         target_state = "TRACKING"
                         filtered_x = None
+                        settle_dwell_start = None
                     else:
-                        if pulse_us > NEUTRAL_PULSE_US:
+                        recovery_target = (
+                            SERVO_VISIBLE_MIN_PULSE_US
+                            + SERVO_VISIBLE_MAX_PULSE_US
+                        ) / 2
+                        # Sweeps toward the middle of the calibrated
+                        # VISIBLE range, not NEUTRAL_PULSE_US -- the
+                        # servo's mechanical rest position has no
+                        # guaranteed relationship to where the camera
+                        # is actually pointed, and sweeping toward a
+                        # wrong assumed "center" here was the likely
+                        # cause of recovery driving the laser further
+                        # out of frame instead of back into it.
+                        if pulse_us > recovery_target:
                             pulse_us = max(
-                                NEUTRAL_PULSE_US, pulse_us - RECOVERY_STEP_US
+                                recovery_target, pulse_us - RECOVERY_STEP_US
                             )
-                        elif pulse_us < NEUTRAL_PULSE_US:
+                        elif pulse_us < recovery_target:
                             pulse_us = min(
-                                NEUTRAL_PULSE_US, pulse_us + RECOVERY_STEP_US
+                                recovery_target, pulse_us + RECOVERY_STEP_US
                             )
                         set_pulse_us(pulse_us)
 
@@ -1179,21 +1308,44 @@ def main():
                             )
                             pulse_us += AXIS_SIGN[CONTROL_AXIS] * fine_correction
                             pulse_us = max(
-                                MIN_PULSE_US,
-                                min(MAX_PULSE_US, pulse_us)
+                                SERVO_VISIBLE_MIN_PULSE_US,
+                                min(SERVO_VISIBLE_MAX_PULSE_US, pulse_us)
                             )
                             set_pulse_us(pulse_us)
 
-                            if JITTER_ENABLE:
-                                target_state = "JITTERING"
-                                jitter_start_time = time.monotonic()
-                                jitter_base_pulse = pulse_us
-                            else:
-                                advance_or_settle()
+                            if settle_dwell_start is None:
+                                settle_dwell_start = time.monotonic()
+
+                            dwelled_long_enough = (
+                                time.monotonic() - settle_dwell_start
+                                >= SETTLE_DWELL_S
+                            )
+
+                            # Both conditions required: this axis has
+                            # sat inside the deadband continuously for
+                            # SETTLE_DWELL_S (not just touched it on
+                            # one frame while passing through), AND
+                            # the actuator's axis has independently
+                            # reached its own SETTLED state. Until
+                            # both are true, hold here (already
+                            # fine-nudged above) and re-check next
+                            # frame -- don't jitter/advance yet.
+
+                            if dwelled_long_enough and actuator_state == "SETTLED":
+
+                                settle_dwell_start = None
+
+                                if JITTER_ENABLE:
+                                    target_state = "JITTERING"
+                                    jitter_start_time = time.monotonic()
+                                    jitter_base_pulse = pulse_us
+                                else:
+                                    advance_or_settle()
 
                         else:
 
                             tracking = True
+                            settle_dwell_start = None
 
                             desired = error_x * AXIS_GAIN_US_PER_PX[CONTROL_AXIS]
 
@@ -1204,8 +1356,8 @@ def main():
 
                             pulse_us += AXIS_SIGN[CONTROL_AXIS] * correction
                             pulse_us = max(
-                                MIN_PULSE_US,
-                                min(MAX_PULSE_US, pulse_us)
+                                SERVO_VISIBLE_MIN_PULSE_US,
+                                min(SERVO_VISIBLE_MAX_PULSE_US, pulse_us)
                             )
 
                             set_pulse_us(pulse_us)
@@ -1241,8 +1393,8 @@ def main():
 
                         jitter_pulse = jitter_base_pulse + jitter_offset
                         jitter_pulse = max(
-                            MIN_PULSE_US,
-                            min(MAX_PULSE_US, jitter_pulse)
+                            SERVO_VISIBLE_MIN_PULSE_US,
+                            min(SERVO_VISIBLE_MAX_PULSE_US, jitter_pulse)
                         )
 
                         set_pulse_us(jitter_pulse)
@@ -1273,24 +1425,36 @@ def main():
                     # Shares the servo's laser-lost trigger (that
                     # condition is "is the laser visible at all",
                     # not axis-specific) -- sweep this axis back
-                    # toward its own home (step 0) too.
+                    # toward its own home (step 0) too, at a fixed
+                    # moderate speed (no target to ramp toward, and
+                    # bursts here are short anyway).
 
                     if actuator_position > 0:
                         step_this_frame = min(
                             ACT_MAX_STEPS_PER_FRAME, actuator_position
                         )
-                        act_move_steps(step_this_frame, -1)
+                        act_move_steps(
+                            step_this_frame, -1,
+                            act_delay_from_speed(ACT_RECOVERY_SPEED_STEPS_S)
+                        )
                         actuator_position -= step_this_frame
 
                     elif actuator_position < 0:
                         step_this_frame = min(
                             ACT_MAX_STEPS_PER_FRAME, -actuator_position
                         )
-                        act_move_steps(step_this_frame, +1)
+                        act_move_steps(
+                            step_this_frame, +1,
+                            act_delay_from_speed(ACT_RECOVERY_SPEED_STEPS_S)
+                        )
                         actuator_position += step_this_frame
 
                     actuator_state = "IDLE"
                     actuator_filtered = None
+                    actuator_settle_dwell_start = None
+                    actuator_speed = 0.0
+                    actuator_last_direction = 0
+                    actuator_last_update = None
 
                 elif actuator_laser_pos is not None:
 
@@ -1309,14 +1473,38 @@ def main():
 
                         if abs(actuator_error) > ACT_RETRACK_DEADBAND_PX:
                             actuator_state = "TRACKING"
+                            actuator_settle_dwell_start = None
 
                     if actuator_state == "TRACKING":
 
                         if abs(actuator_error) <= ACT_SETTLE_DEADBAND_PX:
 
-                            actuator_state = "SETTLED"
+                            # Same dwell idea as the servo: don't
+                            # mark this axis SETTLED off a single
+                            # lucky frame -- require it to sit inside
+                            # the deadband continuously for
+                            # SETTLE_DWELL_S first. Issue no further
+                            # steps while waiting; it's already
+                            # inside the deadband. Not physically
+                            # moving, so there's no speed to carry.
+
+                            actuator_speed = 0.0
+                            actuator_last_direction = 0
+                            actuator_last_update = None
+
+                            if actuator_settle_dwell_start is None:
+                                actuator_settle_dwell_start = time.monotonic()
+
+                            if (
+                                time.monotonic() - actuator_settle_dwell_start
+                                >= SETTLE_DWELL_S
+                            ):
+                                actuator_state = "SETTLED"
+                                actuator_settle_dwell_start = None
 
                         else:
+
+                            actuator_settle_dwell_start = None
 
                             desired_steps = (
                                 actuator_error * ACT_GAIN_STEPS_PER_PX
@@ -1327,19 +1515,74 @@ def main():
                                 min(ACT_MAX_STEPS_PER_FRAME, desired_steps)
                             )
 
-                            steps_this_frame = int(round(
+                            steps_this_frame_target = int(round(
                                 ACT_SIGN * actuator_correction
                             ))
 
-                            if steps_this_frame != 0:
+                            if steps_this_frame_target != 0:
 
-                                direction = 1 if steps_this_frame > 0 else -1
-
-                                act_move_steps(
-                                    abs(steps_this_frame), direction
+                                direction = (
+                                    1 if steps_this_frame_target > 0 else -1
                                 )
 
-                                actuator_position += steps_this_frame
+                                # Must pass through zero speed before
+                                # reversing -- can't be moving both
+                                # ways at once, and an instant
+                                # direction flip at speed is exactly
+                                # the kind of shock that skips steps.
+                                if (
+                                    actuator_last_direction != 0
+                                    and direction != actuator_last_direction
+                                ):
+                                    actuator_speed = 0.0
+
+                                now = time.monotonic()
+                                dt = (
+                                    now - actuator_last_update
+                                    if actuator_last_update is not None
+                                    else 0.0
+                                )
+                                actuator_last_update = now
+                                actuator_last_direction = direction
+
+                                remaining_steps = (
+                                    abs(actuator_error) * ACT_GAIN_STEPS_PER_PX
+                                )
+                                target_speed = act_target_speed(remaining_steps)
+
+                                max_change = ACT_ACCELERATION_STEPS_S2 * dt
+                                speed_diff = target_speed - actuator_speed
+
+                                if abs(speed_diff) <= max_change:
+                                    actuator_speed = target_speed
+                                else:
+                                    actuator_speed += math.copysign(
+                                        max_change, speed_diff
+                                    )
+
+                                # Never exceed what the ramped speed
+                                # allows in this frame's dt, and never
+                                # exceed the estimated remaining gap
+                                # (steps_this_frame_target) either --
+                                # whichever is smaller wins.
+                                steps_this_frame = min(
+                                    abs(steps_this_frame_target),
+                                    max(0, int(round(actuator_speed * dt)))
+                                )
+
+                                step_delay = act_delay_from_speed(
+                                    actuator_speed
+                                )
+
+                                if steps_this_frame > 0 and step_delay is not None:
+
+                                    act_move_steps(
+                                        steps_this_frame, direction, step_delay
+                                    )
+
+                                    actuator_position += (
+                                        direction * steps_this_frame
+                                    )
 
             # ------------------------------------------------
             # Output image
@@ -1352,7 +1595,7 @@ def main():
             draw_queue(output, pending_targets)
 
             if target_state == "SEARCHING":
-                status = "LASER LOST -- RECOVERING TOWARD NEUTRAL"
+                status = "LASER LOST -- RECOVERING TOWARD FRAME CENTER"
                 status_color = (0, 0, 255)
             elif laser_x is None:
                 status = "LASER NOT DETECTED"
@@ -1502,6 +1745,7 @@ def main():
                     target_x, target_y = pending_targets.pop(0)
                     target_state = "IDLE"
                     filtered_x = None
+                    settle_dwell_start = None
 
                     print()
                     print(
@@ -1530,6 +1774,7 @@ def main():
                 # both coordinates and stays valid under either axis.
                 filtered_x = None
                 error_x = None
+                settle_dwell_start = None
 
                 if target_x is not None:
                     target_state = "IDLE"
@@ -1548,6 +1793,7 @@ def main():
                 target_state = "IDLE"
                 tracking = False
                 filtered_x = None
+                settle_dwell_start = None
                 pending_targets = []
                 sequence_running = False
                 settled_since = None
@@ -1562,6 +1808,7 @@ def main():
                 target_state = "IDLE"
                 tracking = False
                 filtered_x = None
+                settle_dwell_start = None
                 pending_targets = []
                 sequence_running = False
                 settled_since = None
