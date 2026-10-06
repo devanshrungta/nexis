@@ -7,8 +7,15 @@ import os
 import csv
 import math
 import random
+import json
+import threading
 import Jetson.GPIO as GPIO
 from datetime import datetime
+
+from st3215 import ST3215
+# pip install st3215
+# https://github.com/Mickael-Roger/python-st3215 -- verified working
+# against this exact ST3215 servo + Waveshare driver board setup.
 
 
 # ============================================================
@@ -23,263 +30,357 @@ FRAME_FPS = 60
 
 
 # ============================================================
-# PWM
+# ST3215 BUS SERVO (via Waveshare ESP32 Servo Driver board)
+#
+# Setup required ONCE per boot before this script will talk to it:
+#   1. On the driver board's own screen, select "Start Serial
+#      Forwarding" from its menu. The board is normally in its own
+#      WiFi/JSON control mode; this on-screen action (no WiFi/web
+#      app needed) switches its USB Type-C port into a transparent
+#      bridge to the servo bus. It stays in this mode until you
+#      switch it back or power-cycle the board -- unless you've
+#      reflashed it with SERIAL_FORWARDING=true in ServoDriverST.ino
+#      so it boots directly into this mode every time.
+#   2. Plug that Type-C port into the Jetson via USB. It should show
+#      up as /dev/ttyUSB0 or /dev/ttyACM0 -- check with `ls /dev/tty*`
+#      before and after plugging in.
+#
+# Positions are 0-4095 over the servo's full 360 degrees (2047/2048 =
+# middle). This servo ramps its own speed/acceleration onboard once
+# given a target position, speed, and acceleration -- so there is no
+# need to hand-compute a smooth approach here. We just keep sending
+# it our best current estimate of the right position.
 # ============================================================
 
-PWM_CHIP = "/sys/class/pwm/pwmchip3"
-PWM_PATH = "/sys/class/pwm/pwmchip3/pwm0"
+ST_SERIAL_PORT = "/dev/ttyUSB0"
+# Check `ls /dev/ttyUSB* /dev/ttyACM*` on the Jetson right after
+# plugging in the driver board's USB cable to confirm this.
 
-PWM_CHANNEL = 0
+ST_BAUDRATE = 115200
+# This is the driver board's Serial Forwarding mode baud rate -- NOT
+# the servo bus's own native 1,000,000 baud (the board handles that
+# internally). The st3215 library's ST3215() constructor doesn't
+# expose a baud-rate argument and opens at 1,000,000 by default, so
+# setup_st_servo() below reaches into its portHandler.ser (the
+# underlying pyserial object) and overrides it to this value -- this
+# was confirmed necessary and working on this exact hardware.
 
-PWM_FREQUENCY = 50
-PERIOD_NS = 20_000_000
+ST_SERVO_ID = 1
+# Factory default ID. Only matters/needs changing if you have more
+# than one ST-series servo on the same bus.
 
+ST_MIN_POSITION = 1981
+ST_MAX_POSITION = 2541
+ST_MIDDLE_POSITION = 2047
 
-# ============================================================
-# SERVO
-# ============================================================
+ST_VISIBLE_MIN_POSITION = ST_MIN_POSITION
+ST_VISIBLE_MAX_POSITION = ST_MAX_POSITION
+# Same idea as the old SERVO_VISIBLE_MIN/MAX_PULSE_US -- the position
+# range within which the laser is ACTUALLY visible in the camera's
+# frame, not the servo's full mechanical range. Defaults to the full
+# range until you calibrate it the same way as before: jog toward
+# each edge, read the position off the overlay, note where the laser
+# exits frame.
 
-MIN_PULSE_US = 500
-MAX_PULSE_US = 2500
+ST_CRUISE_SPEED = 1000
+# Speed (steps/sec) sent with every position command. Max for this
+# servo family is ~3073 steps/sec. This is a moderate starting point
+# -- the servo ramps up/down to and from this speed on its own via
+# ST_ACCEL below, so raising this mainly affects top cruising speed
+# on long moves, not smoothness.
 
-NEUTRAL_PULSE_US = 1500
+ST_ACCEL = 40
+# Servo's onboard start/stop acceleration, 0-254 (larger = snappier
+# ramp). Moderate starting point -- raise it if tracking feels
+# sluggish to start moving, lower it if motion looks jerky at the
+# start/end of a move.
 
-SERVO_VISIBLE_MIN_PULSE_US = MIN_PULSE_US
-SERVO_VISIBLE_MAX_PULSE_US = MAX_PULSE_US
-# The pulse range within which the laser is ACTUALLY visible in
-# the camera's frame -- not necessarily the servo's full
-# mechanical range above, which is very likely wider than what
-# the camera can actually see. Defaults to the full range (no
-# behavior change) until you calibrate it: press R to go to
-# neutral, then manually drive the servo (e.g. quickest way --
-# temporarily click a target far off to one side and watch the
-# video feed) to find the pulse value where the laser JUST exits
-# frame on each side (read it off the "Pulse: ... us" overlay),
-# and set these two to just inside those points. Every place the
-# control loop below moves the servo clamps to THIS range, not
-# the full mechanical range -- so a bad correction (miscalibrated
-# gain, an edge case in the recovery sweep, anything) can't drive
-# the laser out of view even if it tries to. NEUTRAL_PULSE_US
-# above is left alone -- it's the servo's own rest position, used
-# only by R and on quit, not part of this visibility clamp.
+ST_JITTER_AMPLITUDE_POS = 1000
+# Jitter amplitude in position units (was JITTER_AMPLITUDE_US).
+# Position units are finer-grained than the old microsecond pulse
+# width (4096 units over 360 degrees), so this likely needs
+# retuning smaller/larger than the old value felt -- watch it live.
 
 
 # ============================================================
 # LASER DETECTION
 # ============================================================
 
-BRIGHTNESS_MIN = 240
+BRIGHTNESS_MIN = 230
 BRIGHTNESS_MAX = 255
 
-MORPH_KERNEL_SIZE = 5
+MORPH_KERNEL_SIZE = 3
 
-MIN_BLOB_AREA = 10
+MIN_BLOB_AREA = 6
 
 # ============================================================
 # CONTROL
 # ============================================================
 
-SERVO_UPDATE_INTERVAL = 0.05
-# Minimum time between corrections. 0.0 = update every frame,
-# giving continuous motion (was 0.08 before, which visibly
-# "stepped" at ~12.5 updates/sec). Speed and slow-down now
-# come from GAIN_US_PER_PX / MAX_STEP_US below.
+CONTROL_AXIS = "y"
+# Which pixel axis the ST3215 currently follows: "x" (default) or
+# "y". Toggle live with the A key. The actuator (below) always
+# drives whichever axis this ISN'T, so both axes stay covered.
 
-ALPHA = 0.40
-# EMA smoothing factor on the laser x position used for
-# error calculation. Lower = smoother but laggier.
-
-# --------------------------------------------------------
-# Clamped proportional (P) controller
-#
-# Replaces the previous Adam-based controller. Adam normalizes
-# its step by the gradient's own recent magnitude, so the raw
-# step settles to roughly +/-ADAM_LR regardless of error size,
-# and its momentum term (an EMA of recent error) keeps pushing
-# in the old direction for several frames after the error flips
-# sign -- both of which produced the overshoot/oscillation you
-# were seeing whenever the gap was bigger than the deadband but
-# smaller than one step.
-#
-# A plain clamped P-controller fixes this: the commanded
-# correction is directly proportional to the remaining error
-# (so it decelerates smoothly and hits ~0 at ~0 error, no
-# separate "ease" term needed), and it has no memory of past
-# frames, so it can't keep pushing after crossing the target.
-# --------------------------------------------------------
-
-GAIN_US_PER_PX = 0.025
-# How many microseconds of pulse-width correction to command
-# per pixel of remaining error. This should reflect (or be
-# slightly BELOW) the real system response -- i.e. how many us
-# it actually takes to move the laser 1px. Set too high, it can
-# still overshoot despite the clamp; set too low, it just takes
-# a few extra frames to converge. Tune by watching the "Error"
-# overlay: if it overshoots past zero, lower this; if it's
-# sluggish on small errors, raise it.
-
-CONTROL_AXIS = "x"
-# Which pixel axis this single servo currently follows: "x"
-# (default) or "y". Toggle live with the A key. You don't need
-# to re-click or re-queue targets when you switch -- every
-# clicked target already stores both its x and y (from the
-# original click), so switching axis just changes which
-# coordinate of the SAME target(s) the control loop reads.
-
-AXIS_GAIN_US_PER_PX = {
-    "x": GAIN_US_PER_PX,
-    "y": GAIN_US_PER_PX,
-    # ^ Y starts as a copy of your tuned X gain as a starting
-    # point only -- the physical response per pixel is not
-    # guaranteed to match between axes (different lever arm,
-    # different mount geometry, etc). Tune this independently
-    # once you've actually tested the Y axis, the same way you
-    # tuned GAIN_US_PER_PX for X.
+AXIS_GAIN_POS_PER_PX = {
+    "x": 2.0,
+    "y": 2.0,
+    # ^ PLACEHOLDER for both -- this is new hardware, so nothing
+    # carries over from the old AXIS_GAIN_US_PER_PX tuning. Tune the
+    # same way as before: watch the error overlay, lower this if it
+    # overshoots, raise it if sluggish.
 }
 
 AXIS_SIGN = {
     "x": -1,
     "y": 1,
-    # ^ x=-1 matches your existing `pulse_us -= correction`
-    # convention. Flip y to +1 if increasing pulse_us needs to
-    # move the laser in the opposite direction on that axis --
-    # you'll see it immediately as the laser moving away from
-    # the target instead of toward it when you first test Y.
+    # ^ PLACEHOLDER -- also does not carry over from the old PWM
+    # servo (different hardware, different rotation convention).
+    # Flip whichever axis moves the laser away from the target
+    # instead of toward it.
 }
 
-MAX_STEP_US = 15
-# Hard cap on any single correction (top speed for large
-# errors). Raise this to close large gaps faster; the P-control
-# proportionality is what prevents overshoot on the way in, not
-# this cap.
+MAX_POSITION_STEP_PER_UPDATE = 300
+# Trust-region clamp on how far the commanded target position can
+# move in one control update (out of the 0-4095 range) -- same
+# anti-overshoot role MAX_STEP_US played before. The servo's own
+# speed limit (ST_CRUISE_SPEED) bounds physical speed regardless;
+# this bounds how aggressively our estimate itself jumps.
 
-SETTLE_DEADBAND_PX = 2
-# Error must be within this many px to be considered "reached"
-# and enter SETTLED. Kept tight for precision -- with a P-
-# controller (not a fixed step), getting this close does not
-# cause oscillation the way the old fixed-step approach did.
+SERVO_SPEED_FAR = 3000
+# Commanded speed (step/s) for large errors -- near this servo
+# family's ceiling (~3073 step/s per the library's own notes).
+SERVO_SPEED_NEAR = 200
+# Commanded speed (step/s) once close to the target -- gentle final
+# approach instead of slamming in at full speed and relying only on
+# the servo's onboard accel/decel ramp to soften it.
+SERVO_SPEED_EASE_PX = 60
+# Pixel-error distance at which speed starts scaling down from
+# SERVO_SPEED_FAR toward SERVO_SPEED_NEAR. Linear in between.
 
-RETRACK_DEADBAND_PX = 10
-# Once SETTLED, the laser must drift out past THIS looser
-# threshold before correction resumes. This hysteresis gap
-# between SETTLE_DEADBAND_PX and RETRACK_DEADBAND_PX stops
-# detection noise right at the settle boundary from repeatedly
-# flapping the state back into TRACKING.
+JOG_STEP_SERVO = 20
+# Position units moved per I/K keypress while in jog mode.
+JOG_SPEED_SERVO = 200
+# Commanded speed (step/s) for jog moves -- deliberately gentle/slow
+# since jog mode is manual, closely-watched positioning.
+JOG_SPEED_ACTUATOR = 800
+# Commanded speed (step/s) for U/O actuator jog pulses.
+ACTUATOR_JOG_PULSE_S = 0.15
+# Duration of each U/O jog pulse. The actuator is speed-driven, not
+# position-driven, and cv2.waitKey only gives discrete keypress
+# events (no "key held" state) -- so each tap issues a short timed
+# speed pulse rather than a direct position command.
+JOG_OVERTRAVEL_ACTUATOR_STEPS = 20000
+# How far beyond the CURRENTLY SAVED actuator calibration jog mode is
+# allowed to explore, in memory only, while actively re-calibrating.
+# See the jog-mode entry/exit handling for why this exists: without
+# it, you could only ever narrow a saved range, never widen one,
+# since jogging itself was clamped by the same bounds it was trying
+# to move past. The servo doesn't need an equivalent constant -- it
+# has a real absolute backstop (ST_MIN/MAX_POSITION, 0-4095) that jog
+# mode can safely open all the way up to; the actuator has no such
+# known hard stop, so this is a deliberately generous but still
+# bounded allowance rather than fully unbounded travel. Jog mode is
+# manually operated and watched -- you are the safety mechanism
+# during calibration, same as before.
+
+
+def scaled_servo_speed(error_px):
+
+    ease = min(1.0, abs(error_px) / SERVO_SPEED_EASE_PX)
+    return int(SERVO_SPEED_NEAR + ease * (SERVO_SPEED_FAR - SERVO_SPEED_NEAR))
+
+SERVO_UPDATE_INTERVAL = 0.03
+# Minimum time between servo command updates (~33 Hz). Previously 0.0
+# ("every frame") -- at 30-60fps that meant a brand-new MoveTo() command
+# was issued before the servo had any chance to finish or settle into
+# its previous move, constantly interrupting and re-planning its
+# internal speed/accel ramp. That's what produced the visible jerky,
+# abrupt motion. Throttling updates gives each move enough time to
+# actually execute smoothly before the next correction arrives.
+
+ALPHA = 0.4
+# EMA smoothing factor on the laser position used for error calc.
+
+SETTLE_DEADBAND_PX = 5
+RETRACK_DEADBAND_PX = 15
+# Same hysteresis idea as before: SETTLE to enter "reached", the
+# looser RETRACK before resuming active correction.
 
 SETTLE_DWELL_S = 0.3
-# The error must stay continuously within SETTLE_DEADBAND_PX for
-# this long before the target is actually marked reached. Without
-# this, a fast-moving laser that merely crosses through the
-# deadband on its way past the target (e.g. from overshoot, or
-# while still converging) gets counted as "reached" on that one
-# lucky frame. Any frame the error goes back outside the deadband
-# resets the dwell clock -- see settle_dwell_start below. Shared
-# by both the servo and the actuator's own settle check.
+# Error must sit inside SETTLE_DEADBAND_PX continuously this long
+# before actually counting as reached -- guards against a fast pass
+# through the deadband being falsely counted. Shared by both axes.
 
 LASER_LOST_GRACE_S = 0.3
-# How long the laser can go undetected before we treat it as
-# "off the edge of the frame" and start actively recovering,
-# rather than just freezing the servo in place. A short value
-# (a frame or two) is normal detection noise and shouldn't
-# trigger this -- keep it above a few frame periods.
-
-RECOVERY_STEP_US = 15
-# How fast (us per frame) to sweep the pulse back toward
-# NEUTRAL_PULSE_US while the laser is missing. Neutral is used
-# as the recovery target because, for this rig, it's roughly
-# where the camera's field of view is centered -- so sweeping
-# back toward it is the best generic way to bring an
-# off-frame laser back into view without knowing exactly which
-# edge it left from. Recovery stops the instant the laser is
-# seen again, wherever that is.
-
-
-# --------------------------------------------------------
-# Post-target jitter
-#
-# After the target is reached, deliberately wiggles the
-# pulse around the settled position for a short time.
-# --------------------------------------------------------
-
-JITTER_ENABLE = True
-
-JITTER_AMPLITUDE_US = 30
-# How far (in us) the jitter swings from the settled pulse.
-# Larger = more visible/aggressive wiggle.
-
-JITTER_DURATION_S = 3
-# How long (seconds) to jitter after reaching target.
-
-JITTER_FREQUENCY_HZ = 5.0
-# Speed of the sinusoidal component of the jitter. IMPORTANT: this is
-# only sampled once per real loop iteration, so it needs the loop
-# running well above 2x this frequency (Nyquist) to actually look
-# like a smooth wiggle -- ideally 5-10x+ for it to look clean.
-# Your last two runs measured ~11.6fps then ~15.3fps (check the extra
-# log's timestamp deltas to see your current number -- video encoding
-# is the main remaining cost, see VIDEO_WRITE_EVERY_N above). At
-# 15.3fps, 5Hz was only ~3x oversampled -- right at the aliasing edge,
-# which produces a slow drifting "beat" pattern instead of a clean
-# wiggle. 2Hz gives ~7.5x oversampling at that same fps and should
-# look clean. If you later get the loop closer to 60fps, feel free to
-# raise this back toward 5Hz (keep it under roughly fps/5 as a rule
-# of thumb).
-
-JITTER_RANDOMNESS = 0.0
-# Blend between smooth sine motion (0.0) and pure random
-# noise (1.0). e.g. 0.3 = mostly smooth with some noise.
-
-SETTLE_GRACE_PERIOD_S = 0.4
-# After entering SETTLED (jitter finished, or JITTER_ENABLE is
-# False), drift-recovery is paused for this many seconds before
-# SETTLED starts re-checking the real error again. Without this,
-# residual motion from the jitter itself (the servo/laser hasn't
-# mechanically caught up to the settled pulse yet) can read as
-# "still off target," bounce back into TRACKING, immediately
-# re-reach the deadband, and jitter again -- forever.
-# Too short -> the jitter-loop bug can come back.
-# Too long  -> slower to notice genuine drift (e.g. the mount
-# gets bumped) once truly settled.
+RECOVERY_STEP_POS = 20
+# Laser-lost recovery: if undetected this long, sweep the servo back
+# toward the middle of the VISIBLE range (not necessarily
+# ST_MIDDLE_POSITION -- see ST_VISIBLE_MIN/MAX_POSITION above),
+# RECOVERY_STEP_POS position-units per update, until it reappears.
 
 
 # ============================================================
-# LOGGING (unchanged -- original log/video files)
+# JITTER (servo axis only)
+# ============================================================
+
+JITTER_ENABLE = False
+
+JITTER_DURATION_S = 1
+JITTER_FREQUENCY_HZ = 50.0
+# Kept low -- see the long explanation in earlier revisions of this
+# script about aliasing when the loop's achieved fps isn't well
+# above this frequency. Raise only after confirming your fps.
+
+JITTER_RANDOMNESS = 0.0
+
+SETTLE_GRACE_PERIOD_S = 0.4
+# After entering SETTLED, drift-recovery is paused this long before
+# re-checking real error -- avoids residual jitter motion reading as
+# "still off target" and immediately re-triggering.
+
+
+# ============================================================
+# LINEAR ACTUATOR (second DOF) -- fuyu hardware unchanged
+#
+# Only the low-level step/dir/enable control is borrowed from
+# fuyu_actuator.py, same as before. What's NEW here: step pulses are
+# now generated by a dedicated background thread (actuator_thread_
+# loop), not bursted from inside the camera loop. That's the actual
+# fix for the visible jerking -- the previous version's speed math
+# was fine, but bursts of steps synchronized to camera frames (every
+# ~65-85ms) meant real dead time between bursts, which looks and
+# feels jerky no matter how smooth the commanded speed curve is. The
+# thread paces itself in real time, independent of camera fps, so
+# the accel/decel ramp is actually continuous.
+# ============================================================
+
+ACT_STEP_PIN = 29
+ACT_DIR_PIN = 31
+ACT_EN_PIN = 33
+
+ACT_MAX_SPEED_STEPS_S = 10000
+# Raised from 2000 per explicit request -- fast far from target.
+ACT_ACCELERATION_STEPS_S2 = 1500
+# Borrowed from fuyu_actuator.py's own validated MANUAL_ACCELERATION.
+
+ACT_GAIN_STEPS_PER_PX = 0.5
+# PLACEHOLDER -- untuned against real hardware, same as always.
+
+ACT_MIN_TRACKING_SPEED_STEPS_S = 300
+# Floor speed whenever actuator_error is still outside the settle
+# deadband (i.e. genuinely still correcting). Without this, if
+# ACT_GAIN_STEPS_PER_PX under-estimates the true remaining distance,
+# act_target_speed()'s stopping-distance formula can compute a speed
+# so low the actuator effectively stalls -- reading as "stops before
+# reaching the target" even though the pixel error never closed. This
+# never overrides the deadband check itself: once actually within
+# ACT_SETTLE_DEADBAND_PX, speed is still commanded to exactly 0.
+
+ACT_SIGN = -1
+# Confirmed correct for this hardware already.
+
+ACT_RECOVERY_SPEED_STEPS_S = 400
+# Fixed, non-ramped speed for the laser-lost recovery sweep, mirrors
+# fuyu_actuator.py's own MANUAL_START_SPEED (500) as an
+# already-validated instant-start speed for this actuator.
+
+ACT_SETTLE_DEADBAND_PX = SETTLE_DEADBAND_PX
+ACT_RETRACK_DEADBAND_PX = RETRACK_DEADBAND_PX
+
+
+# ============================================================
+# WORLD-FRAME TARGET LOCK (odometry-driven feedforward)
+#
+# Lets the laser keep pointing at a fixed GROUND point while the vehicle
+# moves, instead of chasing a pixel. See the accompanying design notes for
+# the full reasoning -- short version: at the moment a pixel-target is
+# SETTLED, the servo/actuator's own state already encodes the correct aim
+# direction (the laser is sitting on it), so locking ray-casts THAT
+# direction, from the current vehicle pose, onto an assumed flat ground
+# plane, to get a world-frame (x, y). From then on, every frame, the
+# feedforward math re-aims at that same world point using the vehicle's
+# CURRENT pose. This does not use the camera at all once locked -- it has
+# to work even when the target is out of frame.
+#
+# No vision trim is blended on top yet (see design notes) -- this is pure
+# feedforward. Pixel error is still computed and shown on screen for you
+# to judge how much drift there is before adding a trim.
+# ============================================================
+
+VEHICLE_POSE_FILE = "vehicle_pose.txt"
+# Whatever process knows the vehicle's current pose writes a single line
+# "x y yaw_rad unix_timestamp" to this file, overwritten each update. For
+# now, with no ROS running, nothing writes it -- get_vehicle_pose() then
+# returns None and world-lock mode safely holds its last commanded aim
+# rather than guess. The standalone ROS2 node provided separately writes
+# to this same file from /odom -- no changes needed here when that's
+# wired up, just point ODOM_TOPIC's VEHICLE_POSE_FILE at the same path.
+
+VEHICLE_POSE_MAX_AGE_S = 1.0
+# Pose older than this is treated as unavailable. Stale odometry driving
+# the aim is worse than no odometry (silently wrong vs. visibly frozen).
+
+MOUNT_HEIGHT_M = 1.2
+# PLACEHOLDER -- MEASURE THIS. Height of the servo/actuator mount above
+# the ground, straight down. Used to convert an aim direction into a
+# ground range via basic trigonometry (this whole model assumes flat,
+# locally-planar ground at this fixed height below the mount).
+
+MOUNT_FORWARD_OFFSET_M = 0.0
+MOUNT_LATERAL_OFFSET_M = 0.0
+# PLACEHOLDER -- measure/estimate: the mount's position relative to
+# wherever the vehicle's odometry frame is referenced (base_link),
+# forward (+x) and left (+y) in the vehicle's own frame.
+
+MOUNT_YAW_OFFSET_DEG = 0.0
+# PLACEHOLDER -- if the mount faces anything other than straight ahead
+# relative to the vehicle's forward axis, that offset, in degrees.
+
+AZIMUTH_DEG_PER_SERVO_UNIT = 360.0 / 4096.0
+# Exactly right ONLY if the servo's rotation axis is vertical and directly
+# drives the pan axis with no linkage/gearing in between. If there's any
+# mechanical reduction, measure this directly instead of assuming it.
+
+ELEVATION_HOME_DEG = 45.0
+ELEVATION_DEG_PER_ACTUATOR_STEP = 0.01
+# PLACEHOLDER, and the shakiest calibration in this whole model. Assumes
+# the linear actuator drives elevation through roughly a CONSTANT
+# degrees-per-step relationship, which only holds if the mechanical
+# linkage (leadscrew into whatever tilts the mount) is close to linear
+# over its travel. If it drives a bellcrank/lever arrangement, this is
+# almost certainly nonlinear, especially near the ends of travel. Worth
+# measuring a handful of (actuator_position, actual elevation angle)
+# points by hand before trusting this beyond a rough first pass.
+
+ACTUATOR_MIN_POSITION = -5000
+ACTUATOR_MAX_POSITION = 5000
+# PLACEHOLDER SAFETY LIMIT -- the actuator has real mechanical travel
+# limits that NOTHING in this script has ever enforced before now. Pixel-
+# based control stayed safe by construction (bounded by what was visible
+# in frame); a computed elevation angle has no such natural bound. These
+# numbers are not measured -- get the actuator's real safe step range
+# (or wire up limit switches) before trusting world-lock to drive it
+# unattended.
+
+
+# ============================================================
+# LOGGING
 # ============================================================
 
 LOG_DIR = "servo_logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 
-os.makedirs(
-    LOG_DIR,
-    exist_ok=True
-)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-timestamp = datetime.now().strftime(
-    "%Y%m%d_%H%M%S"
-)
-
-LOG_FILE = os.path.join(
-    LOG_DIR,
-    f"laser_servo_{timestamp}.csv"
-)
-
-VIDEO_FILE = os.path.join(
-    LOG_DIR,
-    f"laser_servo_{timestamp}.mp4"
-)
+LOG_FILE = os.path.join(LOG_DIR, f"laser_servo_{timestamp}.csv")
+VIDEO_FILE = os.path.join(LOG_DIR, f"laser_servo_{timestamp}.mp4")
 
 video_writer = None
 
 VIDEO_WRITE_EVERY_N = 1
-# Write every Nth frame to the output video instead of every frame.
-# Encoding a full side-by-side (2x width) frame with mp4v every
-# iteration is the other prime suspect (alongside the per-frame log
-# flush fixed above) for the ~11.6fps loop your log shows, against a
-# nominal 60fps camera. To isolate it: temporarily set this to 3-5,
-# re-run, and check the frame dt in the extra log the same way -- if
-# the fps jumps back up close to 60, the video encode is the
-# bottleneck, and it's worth moving to a hardware encoder (e.g. via
-# GStreamer) or a background writer thread rather than skipping
-# frames permanently.
+# Write every Nth frame to the output video. Set to 3-5 to test
+# whether the mp4v encode is costing you fps (it was, previously).
 
 
 def setup_video_writer(width, height, fps):
@@ -287,14 +388,10 @@ def setup_video_writer(width, height, fps):
     global video_writer
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
     combined_width = width * 2
 
     video_writer = cv2.VideoWriter(
-        VIDEO_FILE,
-        fourcc,
-        fps,
-        (combined_width, height)
+        VIDEO_FILE, fourcc, fps, (combined_width, height)
     )
 
     if not video_writer.isOpened():
@@ -308,129 +405,57 @@ csv_writer = None
 
 def setup_logging():
 
-    global log_file
-    global csv_writer
+    global log_file, csv_writer
 
-    log_file = open(
-        LOG_FILE,
-        "w",
-        newline=""
-    )
-
-    csv_writer = csv.writer(
-        log_file
-    )
+    log_file = open(LOG_FILE, "w", newline="")
+    csv_writer = csv.writer(log_file)
 
     csv_writer.writerow([
-        "timestamp",
-        "frame",
-        "target_x",
-        "target_y",
-        "laser_x",
-        "laser_y",
-        "error_x",
-        "pulse_us",
-        "blob_area",
-        "num_contours",
-        "tracking"
+        "timestamp", "frame", "target_x", "target_y",
+        "laser_x", "laser_y", "error_x", "servo_position",
+        "blob_area", "num_contours", "tracking"
     ])
-
     log_file.flush()
 
 
 def log_data(
-    frame_number,
-    target_x,
-    target_y,
-    laser_x,
-    laser_y,
-    error_x,
-    pulse_us,
-    blob_area,
-    num_contours,
-    tracking
+    frame_number, target_x, target_y, laser_x, laser_y,
+    error_x, servo_position, blob_area, num_contours, tracking
 ):
-
     if csv_writer is None:
         return
 
     csv_writer.writerow([
-        time.time(),
-        frame_number,
-        target_x,
-        target_y,
-        laser_x,
-        laser_y,
-        error_x,
-        pulse_us,
-        blob_area,
-        num_contours,
-        tracking
+        time.time(), frame_number, target_x, target_y,
+        laser_x, laser_y, error_x, servo_position,
+        blob_area, num_contours, tracking
     ])
 
-    # Flushing (fsync-like disk I/O) every single frame was costing
-    # real time on every loop iteration -- flush periodically instead.
-    # The finally block still flushes+closes on a normal exit, so you
-    # only risk losing the last <0.5s of rows on a hard crash.
     if frame_number % 30 == 0:
         log_file.flush()
 
 
-# ============================================================
-# Separate diagnostic log
-#
-# Does not touch LOG_FILE/log_data above. Captures everything
-# needed to debug detection + control behavior from the CSV
-# alone, without needing the video or OCR.
-# ============================================================
-
-EXTRA_LOG_FILE = os.path.join(
-    LOG_DIR,
-    f"laser_servo_{timestamp}_extra.csv"
-)
-
+EXTRA_LOG_FILE = os.path.join(LOG_DIR, f"laser_servo_{timestamp}_extra.csv")
 extra_log_file = None
 extra_csv_writer = None
 
 EXTRA_LOG_FIELDS = [
-    "timestamp",
-    "frame",
-    "status_text",
-    "target_state",
-    "control_axis",
-    "sequence_running",
-    "queue_remaining",
-    "laser_x",
-    "laser_y",
-    "filtered_x",
-    "error_x",
-    "correction_us",
-    "pulse_us",
-    "jitter_offset_us",
-    "actuator_axis",
-    "actuator_state",
-    "actuator_error",
-    "actuator_position",
+    "timestamp", "frame", "status_text", "target_state", "control_axis",
+    "sequence_running", "queue_remaining", "laser_x", "laser_y",
+    "filtered_x", "error_x", "servo_position", "actuator_axis",
+    "actuator_state", "actuator_error", "actuator_position",
+    "actuator_speed", "world_lock_active", "world_lock_x", "world_lock_y",
+    "vehicle_pose_x", "vehicle_pose_y", "vehicle_pose_yaw",
 ]
 
 
 def setup_extra_logging():
 
-    global extra_log_file
-    global extra_csv_writer
+    global extra_log_file, extra_csv_writer
 
-    extra_log_file = open(
-        EXTRA_LOG_FILE,
-        "w",
-        newline=""
-    )
-
-    extra_csv_writer = csv.writer(
-        extra_log_file
-    )
-
+    extra_log_file = open(EXTRA_LOG_FILE, "w", newline="")
+    extra_csv_writer = csv.writer(extra_log_file)
     extra_csv_writer.writerow(EXTRA_LOG_FIELDS)
-
     extra_log_file.flush()
 
 
@@ -439,29 +464,14 @@ def log_extra_data(values):
     if extra_csv_writer is None:
         return
 
-    row = [time.time()] + [
-        values.get(field) for field in EXTRA_LOG_FIELDS[1:]
-    ]
-
+    row = [time.time()] + [values.get(field) for field in EXTRA_LOG_FIELDS[1:]]
     extra_csv_writer.writerow(row)
 
-    # See the matching comment in log_data() -- same fix, same reason.
     if values.get("frame", 0) % 30 == 0:
         extra_log_file.flush()
 
 
-# ============================================================
-# Tuned-parameter dump
-#
-# Writes every tunable constant's active value to its own file
-# once at startup, so a given log/video can always be matched
-# back to the exact settings that produced it.
-# ============================================================
-
-PARAMS_LOG_FILE = os.path.join(
-    LOG_DIR,
-    f"laser_servo_{timestamp}_params.csv"
-)
+PARAMS_LOG_FILE = os.path.join(LOG_DIR, f"laser_servo_{timestamp}_params.csv")
 
 
 def get_tunable_params():
@@ -474,38 +484,52 @@ def get_tunable_params():
         "SERVO_UPDATE_INTERVAL": SERVO_UPDATE_INTERVAL,
         "ALPHA": ALPHA,
         "CONTROL_AXIS": CONTROL_AXIS,
-        "GAIN_US_PER_PX": GAIN_US_PER_PX,
-        "AXIS_GAIN_US_PER_PX_X": AXIS_GAIN_US_PER_PX["x"],
-        "AXIS_GAIN_US_PER_PX_Y": AXIS_GAIN_US_PER_PX["y"],
+        "AXIS_GAIN_POS_PER_PX_X": AXIS_GAIN_POS_PER_PX["x"],
+        "AXIS_GAIN_POS_PER_PX_Y": AXIS_GAIN_POS_PER_PX["y"],
         "AXIS_SIGN_X": AXIS_SIGN["x"],
         "AXIS_SIGN_Y": AXIS_SIGN["y"],
-        "MAX_STEP_US": MAX_STEP_US,
+        "MAX_POSITION_STEP_PER_UPDATE": MAX_POSITION_STEP_PER_UPDATE,
+        "SERVO_SPEED_FAR": SERVO_SPEED_FAR,
+        "SERVO_SPEED_NEAR": SERVO_SPEED_NEAR,
+        "SERVO_SPEED_EASE_PX": SERVO_SPEED_EASE_PX,
         "SETTLE_DEADBAND_PX": SETTLE_DEADBAND_PX,
         "RETRACK_DEADBAND_PX": RETRACK_DEADBAND_PX,
         "SETTLE_DWELL_S": SETTLE_DWELL_S,
         "LASER_LOST_GRACE_S": LASER_LOST_GRACE_S,
-        "RECOVERY_STEP_US": RECOVERY_STEP_US,
+        "RECOVERY_STEP_POS": RECOVERY_STEP_POS,
         "JITTER_ENABLE": JITTER_ENABLE,
-        "JITTER_AMPLITUDE_US": JITTER_AMPLITUDE_US,
         "JITTER_DURATION_S": JITTER_DURATION_S,
         "JITTER_FREQUENCY_HZ": JITTER_FREQUENCY_HZ,
         "JITTER_RANDOMNESS": JITTER_RANDOMNESS,
+        "ST_JITTER_AMPLITUDE_POS": ST_JITTER_AMPLITUDE_POS,
         "SETTLE_GRACE_PERIOD_S": SETTLE_GRACE_PERIOD_S,
-        "MIN_PULSE_US": MIN_PULSE_US,
-        "MAX_PULSE_US": MAX_PULSE_US,
-        "NEUTRAL_PULSE_US": NEUTRAL_PULSE_US,
-        "SERVO_VISIBLE_MIN_PULSE_US": SERVO_VISIBLE_MIN_PULSE_US,
-        "SERVO_VISIBLE_MAX_PULSE_US": SERVO_VISIBLE_MAX_PULSE_US,
-        "PWM_FREQUENCY": PWM_FREQUENCY,
-        "VIDEO_WRITE_EVERY_N": VIDEO_WRITE_EVERY_N,
+        "ST_CRUISE_SPEED": ST_CRUISE_SPEED,
+        "ST_ACCEL": ST_ACCEL,
+        "ST_VISIBLE_MIN_POSITION": ST_VISIBLE_MIN_POSITION,
+        "ST_VISIBLE_MAX_POSITION": ST_VISIBLE_MAX_POSITION,
         "ACT_MAX_SPEED_STEPS_S": ACT_MAX_SPEED_STEPS_S,
         "ACT_ACCELERATION_STEPS_S2": ACT_ACCELERATION_STEPS_S2,
-        "ACT_RECOVERY_SPEED_STEPS_S": ACT_RECOVERY_SPEED_STEPS_S,
         "ACT_GAIN_STEPS_PER_PX": ACT_GAIN_STEPS_PER_PX,
-        "ACT_SIGN": ACT_SIGN,
-        "ACT_MAX_STEPS_PER_FRAME": ACT_MAX_STEPS_PER_FRAME,
+        "ACT_MIN_TRACKING_SPEED_STEPS_S": ACT_MIN_TRACKING_SPEED_STEPS_S,
         "ACT_SETTLE_DEADBAND_PX": ACT_SETTLE_DEADBAND_PX,
         "ACT_RETRACK_DEADBAND_PX": ACT_RETRACK_DEADBAND_PX,
+        "ACT_SIGN": ACT_SIGN,
+        "ACT_RECOVERY_SPEED_STEPS_S": ACT_RECOVERY_SPEED_STEPS_S,
+        "JOG_STEP_SERVO": JOG_STEP_SERVO,
+        "JOG_SPEED_SERVO": JOG_SPEED_SERVO,
+        "JOG_SPEED_ACTUATOR": JOG_SPEED_ACTUATOR,
+        "ACTUATOR_JOG_PULSE_S": ACTUATOR_JOG_PULSE_S,
+        "JOG_OVERTRAVEL_ACTUATOR_STEPS": JOG_OVERTRAVEL_ACTUATOR_STEPS,
+        "VIDEO_WRITE_EVERY_N": VIDEO_WRITE_EVERY_N,
+        "MOUNT_HEIGHT_M": MOUNT_HEIGHT_M,
+        "MOUNT_FORWARD_OFFSET_M": MOUNT_FORWARD_OFFSET_M,
+        "MOUNT_LATERAL_OFFSET_M": MOUNT_LATERAL_OFFSET_M,
+        "MOUNT_YAW_OFFSET_DEG": MOUNT_YAW_OFFSET_DEG,
+        "AZIMUTH_DEG_PER_SERVO_UNIT": AZIMUTH_DEG_PER_SERVO_UNIT,
+        "ELEVATION_HOME_DEG": ELEVATION_HOME_DEG,
+        "ELEVATION_DEG_PER_ACTUATOR_STEP": ELEVATION_DEG_PER_ACTUATOR_STEP,
+        "ACTUATOR_MIN_POSITION": ACTUATOR_MIN_POSITION,
+        "ACTUATOR_MAX_POSITION": ACTUATOR_MAX_POSITION,
     }
 
 
@@ -514,10 +538,8 @@ def save_params_log():
     params = get_tunable_params()
 
     with open(PARAMS_LOG_FILE, "w", newline="") as f:
-
         writer = csv.writer(f)
         writer.writerow(["parameter", "value"])
-
         for key, value in params.items():
             writer.writerow([key, value])
 
@@ -525,306 +547,328 @@ def save_params_log():
 
 
 # ============================================================
-# PWM
+# ST3215 SERVO CONTROL
 # ============================================================
 
-def write_sysfs(path, value):
-
-    with open(path, "w") as f:
-        f.write(str(value))
+st_servo = None
 
 
-def set_pulse_us(pulse_us):
+def setup_st_servo():
 
-    pulse_us = max(
-        MIN_PULSE_US,
-        min(MAX_PULSE_US, pulse_us)
-    )
+    global st_servo
 
-    pulse_ns = int(
-        round(pulse_us * 1000)
-    )
+    st_servo = ST3215(ST_SERIAL_PORT)
 
-    write_sysfs(
-        f"{PWM_PATH}/duty_cycle",
-        pulse_ns
-    )
-
-    return pulse_us
-
-
-def setup_pwm():
-
-    if not os.path.exists(PWM_PATH):
-
-        write_sysfs(
-            f"{PWM_CHIP}/export",
-            PWM_CHANNEL
+    # The library opens at 1,000,000 baud internally with no way to pass
+    # a different rate to the constructor. Override it directly on the
+    # underlying pyserial object -- confirmed to take effect live.
+    try:
+        st_servo.portHandler.ser.baudrate = ST_BAUDRATE
+    except AttributeError:
+        print(
+            f"[ST3215] WARNING: could not set baud rate on "
+            f"portHandler.ser -- inspect with: python3 -c \"from st3215 "
+            f"import ST3215; s = ST3215('{ST_SERIAL_PORT}'); "
+            f"print(dir(s.portHandler))\""
         )
 
-        time.sleep(0.1)
+    if st_servo.PingServo(ST_SERVO_ID):
+        print(f"[ST3215] Servo ID {ST_SERVO_ID} responded")
+    else:
+        print(
+            f"[ST3215] WARNING: ping to ID {ST_SERVO_ID} did not succeed. "
+            f"Check wiring, ID, and that 'Start Serial Forwarding' is "
+            f"active on the driver board."
+        )
+
+
+def set_servo_position(position, speed=ST_CRUISE_SPEED, acc=ST_ACCEL):
+
+    # HARD LIMIT -- enforced here, centrally, regardless of caller.
+    # Every code path that moves the servo (tracking, jog, sweep test,
+    # jitter, recovery, neutral reset) goes through this function, so
+    # putting the clamp here means none of them can ever command the
+    # servo past the calibrated safe range, even a future call site
+    # that forgets to clamp first. ST_VISIBLE_MIN/MAX_POSITION are
+    # loaded from CALIBRATION_FILE at startup (see load_calibration())
+    # and updated live when you mark new endpoints.
+    position = int(max(
+        ST_VISIBLE_MIN_POSITION, min(ST_VISIBLE_MAX_POSITION, position)
+    ))
+    # Backstop against the servo's own absolute electrical range, in
+    # case calibration is somehow missing/corrupt.
+    position = int(max(ST_MIN_POSITION, min(ST_MAX_POSITION, position)))
+
+    st_servo.MoveTo(ST_SERVO_ID, position, speed=speed, acc=acc, wait=False)
+    return position
+
+
+def close_st_servo():
 
     try:
-
-        write_sysfs(
-            f"{PWM_PATH}/enable",
-            0
-        )
-
-    except Exception:
-        pass
-
-    write_sysfs(
-        f"{PWM_PATH}/period",
-        PERIOD_NS
-    )
-
-    set_pulse_us(
-        NEUTRAL_PULSE_US
-    )
-
-    write_sysfs(
-        f"{PWM_PATH}/enable",
-        1
-    )
-
-
-def stop_pwm():
-
-    try:
-
-        write_sysfs(
-            f"{PWM_PATH}/enable",
-            0
-        )
-
+        st_servo.portHandler.closePort()
     except Exception:
         pass
 
 
 # ============================================================
-# LINEAR ACTUATOR (second DOF)
+# CALIBRATION PERSISTENCE
 #
-# Only the low-level step/dir/enable control is borrowed from
-# your fuyu_actuator.py (TMC2209-driven FUYU FPB30E500RB42) --
-# not its calibration/limit-switch homing, keyboard jog loop, or
-# acceleration ramps, none of which apply to closed-loop pixel
-# tracking the way the servo's own P-controller already works.
-#
-# This actuator always drives whichever axis the servo is NOT
-# currently on -- the complement of CONTROL_AXIS -- so the two
-# DOF together cover both X and Y every frame, automatically
-# following you if you press A to swap the servo's axis. The
-# servo's own code above this point is completely untouched.
-#
-# Important open-loop caveat, inherited as-is from your script:
-# there's no encoder or limit-switch feedback here, same as
-# fuyu_actuator.py with CALIBRATION_ENABLED = False. "Position"
-# below is just a step count from wherever the actuator happened
-# to be when this script started -- not a calibrated absolute
-# position. Step 0 is used as this axis's "home"/neutral, the
-# same role NEUTRAL_PULSE_US plays for the servo.
+# Saves/loads the manually-jogged safe-range endpoints for both
+# axes so they don't need to be re-set every run. Written every
+# time an endpoint is marked (keys 1/2/3/4), not just on request.
 # ============================================================
 
-ACT_STEP_PIN = 29
-ACT_DIR_PIN = 31
-ACT_EN_PIN = 33
-# Same physical (BOARD) pin numbers as fuyu_actuator.py.
+CALIBRATION_FILE = "servo_calibration.json"
 
-ACT_MAX_SPEED_STEPS_S = 2000
-# Top cruising speed (steps/sec) when there's plenty of distance
-# left to cover. Actual speed each frame is acceleration-limited
-# below this -- it's never commanded instantly.
 
-ACT_ACCELERATION_STEPS_S2 = 1500
-# How fast speed is allowed to ramp up or down (steps/sec^2).
-# THIS is the actual fix for the vibration and the overshoot you
-# saw: the previous version jumped straight to a target step rate
-# every frame with no ramp, which is exactly the failure mode
-# that makes a stepper lose sync (miss steps) and vibrate/stall
-# instead of turning smoothly -- and once it's missing steps, the
-# software's step count stops matching reality, which is how it
-# can look like it "kept on moving" past the target. This value
-# is borrowed directly from fuyu_actuator.py's own
-# MANUAL_ACCELERATION, since that's an already-validated safe
-# ramp rate for this exact actuator.
-#
-# Each frame, actual speed moves toward the frame's target speed
-# by at most ACT_ACCELERATION_STEPS_S2 * dt (see actuator_speed
-# below) -- a proper trapezoidal motion profile: accelerate while
-# far away, then decelerate at exactly the rate needed to arrive
-# at zero remaining distance with zero speed (v = sqrt(2 * a * d),
-# the standard stopping-distance formula), rather than the
-# previous fixed-distance linear ramp, which had no actual
-# relationship to how fast the actuator could safely decelerate.
+def load_calibration():
 
-ACT_GAIN_STEPS_PER_PX = 0.5
-# Steps of correction per pixel of remaining error on this
-# actuator's axis -- i.e. the calibration between pixels and
-# steps, used to estimate how many steps are left to close the
-# current gap (which the deceleration formula above needs).
-# PLACEHOLDER -- unlike GAIN_US_PER_PX for the servo, this has
-# never been tuned against real hardware. Tune it the same way:
-# watch this axis's error overlay, lower it if it overshoots,
-# raise it if it's sluggish.
+    global ST_VISIBLE_MIN_POSITION, ST_VISIBLE_MAX_POSITION
+    global ACTUATOR_MIN_POSITION, ACTUATOR_MAX_POSITION
 
-ACT_SIGN = -1
-# +1 or -1. Flip this if the actuator moves away from the target
-# instead of toward it.
+    if os.path.exists(CALIBRATION_FILE):
+        try:
+            with open(CALIBRATION_FILE) as f:
+                cal = json.load(f)
+            ST_VISIBLE_MIN_POSITION = int(cal["servo_min"])
+            ST_VISIBLE_MAX_POSITION = int(cal["servo_max"])
+            ACTUATOR_MIN_POSITION = int(cal["actuator_min"])
+            ACTUATOR_MAX_POSITION = int(cal["actuator_max"])
+            print(
+                f"[CALIBRATION] Loaded from {CALIBRATION_FILE}: "
+                f"servo=[{ST_VISIBLE_MIN_POSITION}, {ST_VISIBLE_MAX_POSITION}]  "
+                f"actuator=[{ACTUATOR_MIN_POSITION}, {ACTUATOR_MAX_POSITION}]"
+            )
+            return True
+        except Exception as e:
+            print(f"[CALIBRATION] WARNING: failed to load {CALIBRATION_FILE}: {e}")
 
-ACT_MAX_STEPS_PER_FRAME = 40
-# Hard safety cap on steps issued in a single frame, independent
-# of the speed profile above -- this bounds worst-case per-frame
-# blocking time regardless of what speed the ramp reaches. At
-# ACT_MAX_SPEED_STEPS_S, 40 steps blocks for about 2*40/2000 =
-# 40ms in the worst case -- watch your achieved fps once this is
-# live, the same way VIDEO_WRITE_EVERY_N was needed for the video
-# encode.
+    print(
+        "[CALIBRATION] WARNING: no saved calibration found -- currently "
+        f"using UNCALIBRATED defaults: servo=[{ST_VISIBLE_MIN_POSITION}, "
+        f"{ST_VISIBLE_MAX_POSITION}]  actuator=[{ACTUATOR_MIN_POSITION}, "
+        f"{ACTUATOR_MAX_POSITION}]. Press M to jog to your real safe "
+        "endpoints and mark them (1/2/3/4) before selecting a target."
+    )
+    return False
 
-ACT_RECOVERY_SPEED_STEPS_S = 400
-# Fixed (non-ramped) speed used only for the laser-lost recovery
-# sweep back toward home, not for normal tracking. Borrowed
-# directly from fuyu_actuator.py's MANUAL_START_SPEED (500) --
-# an already-validated speed this actuator can start at directly
-# without ramping, kept slightly under that as a margin. Recovery
-# bursts are short (capped by ACT_MAX_STEPS_PER_FRAME same as
-# everything else), so the full accel/decel treatment isn't
-# needed here.
 
-ACT_SETTLE_DEADBAND_PX = SETTLE_DEADBAND_PX
-ACT_RETRACK_DEADBAND_PX = RETRACK_DEADBAND_PX
-# Start as copies of the servo's hysteresis thresholds. The
-# actuator's real positioning resolution/backlash hasn't been
-# characterized -- tune these independently once it has.
+def save_calibration():
+
+    global ST_VISIBLE_MIN_POSITION, ST_VISIBLE_MAX_POSITION
+
+    # Normalize order -- if endpoints were marked out of order (e.g.
+    # "max" jogged to a smaller position than a previously-marked
+    # "min"), max(MIN, min(MAX, x)) with MIN > MAX silently resolves
+    # every value to the same bound instead of raising an error. Swap
+    # rather than let that happen unnoticed.
+    if ST_VISIBLE_MIN_POSITION > ST_VISIBLE_MAX_POSITION:
+        ST_VISIBLE_MIN_POSITION, ST_VISIBLE_MAX_POSITION = (
+            ST_VISIBLE_MAX_POSITION, ST_VISIBLE_MIN_POSITION
+        )
+
+    cal = {
+        "servo_min": ST_VISIBLE_MIN_POSITION,
+        "servo_max": ST_VISIBLE_MAX_POSITION,
+        "actuator_min": ACTUATOR_MIN_POSITION,
+        "actuator_max": ACTUATOR_MAX_POSITION,
+    }
+    with open(CALIBRATION_FILE, "w") as f:
+        json.dump(cal, f, indent=2)
+
+    print(f"[CALIBRATION] Saved to {CALIBRATION_FILE}: {cal}")
+
+
+# ============================================================
+# LINEAR ACTUATOR -- low-level GPIO control (unchanged pins)
+# ============================================================
 
 GPIO.setmode(GPIO.BOARD)
-
 GPIO.setup(ACT_STEP_PIN, GPIO.OUT, initial=GPIO.LOW)
 GPIO.setup(ACT_DIR_PIN, GPIO.OUT, initial=GPIO.LOW)
 GPIO.setup(ACT_EN_PIN, GPIO.OUT, initial=GPIO.HIGH)
 
 
 def act_enable():
-
-    # TMC2209 EN is active LOW -- same convention as
-    # fuyu_actuator.py's enable_motor().
-
     GPIO.output(ACT_EN_PIN, GPIO.LOW)
 
 
 def act_disable():
-
     GPIO.output(ACT_EN_PIN, GPIO.HIGH)
 
 
 def act_set_direction(direction):
-
-    GPIO.output(
-        ACT_DIR_PIN,
-        GPIO.HIGH if direction > 0 else GPIO.LOW
-    )
-
+    GPIO.output(ACT_DIR_PIN, GPIO.HIGH if direction > 0 else GPIO.LOW)
     time.sleep(0.00001)
-    # Matches fuyu_actuator.py's DIR_SETUP_TIME -- lets the DIR
-    # signal settle before the first STEP pulse.
 
 
 def act_step_once(delay):
-
     GPIO.output(ACT_STEP_PIN, GPIO.HIGH)
     time.sleep(delay)
-
     GPIO.output(ACT_STEP_PIN, GPIO.LOW)
     time.sleep(delay)
 
 
 def act_target_speed(remaining_steps):
-
-    # Standard trapezoidal-motion-profile stopping-distance
-    # formula: to come to a stop exactly at zero remaining
-    # distance under a fixed deceleration `a`, current speed must
-    # not exceed sqrt(2 * a * distance). Below this, the speed
-    # ramp toward it (actuator_speed, applied per-frame where this
-    # is called) naturally decelerates at the right rate instead
-    # of slamming into ACT_SETTLE_DEADBAND_PX at full speed.
-
+    # Stopping-distance formula: v = sqrt(2 * a * d), same as before.
     stopping_speed = math.sqrt(
         2 * ACT_ACCELERATION_STEPS_S2 * max(0.0, remaining_steps)
     )
-
     return min(ACT_MAX_SPEED_STEPS_S, stopping_speed)
 
 
 def act_delay_from_speed(speed_steps_s):
-
     if speed_steps_s <= 0:
         return None
-
     return 1.0 / (2.0 * speed_steps_s)
 
 
-def act_move_steps(n_steps, direction, delay):
+# --------------------------------------------------------
+# Background stepping thread. The vision/control loop only ever
+# writes to _actuator_target_speed_signed (a signed steps/sec
+# value: sign = direction, magnitude = desired speed, 0 = stop).
+# This thread turns that into an actual, continuously-ramped pulse
+# train, independent of camera frame timing.
+# --------------------------------------------------------
 
-    # Blocking -- issues n_steps STEP pulses right away. Callers
-    # keep n_steps within ACT_MAX_STEPS_PER_FRAME so this can
-    # only block for one frame's worth of time at most.
+_actuator_lock = threading.Lock()
+_actuator_target_speed_signed = 0.0
+_actuator_position = 0
+_actuator_current_speed_signed = 0.0
+_actuator_running = True
 
-    if n_steps <= 0:
-        return
 
-    act_set_direction(direction)
-    act_enable()
+def actuator_thread_loop():
 
-    for _ in range(n_steps):
+    global _actuator_position, _actuator_current_speed_signed
+
+    current_speed_signed = 0.0
+    current_direction = 0
+    last_time = time.monotonic()
+
+    while _actuator_running:
+
+        now = time.monotonic()
+        dt = now - last_time
+        last_time = now
+
+        # Safety clamp: if this thread got starved for a stretch (e.g.
+        # the OpenCV-heavy main loop held the GIL for a while), dt could
+        # spike. Uncapped, that lets max_change below jump the commanded
+        # speed almost straight to its target in one tick instead of
+        # ramping smoothly -- a second source of abrupt motion, separate
+        # from the servo one. Cap dt so one slow tick can't do that.
+        dt = min(dt, 0.05)
+
+        with _actuator_lock:
+            target_speed_signed = _actuator_target_speed_signed
+
+        target_direction = (
+            1 if target_speed_signed > 0
+            else -1 if target_speed_signed < 0
+            else 0
+        )
+
+        # Must pass through zero speed before reversing direction.
+        if (
+            current_direction != 0
+            and target_direction != 0
+            and target_direction != current_direction
+        ):
+            target_speed_signed = 0.0
+
+        max_change = ACT_ACCELERATION_STEPS_S2 * dt
+        diff = target_speed_signed - current_speed_signed
+
+        if abs(diff) <= max_change:
+            current_speed_signed = target_speed_signed
+        else:
+            current_speed_signed += math.copysign(max_change, diff)
+
+        _actuator_current_speed_signed = current_speed_signed
+
+        if abs(current_speed_signed) < 1.0:
+            current_direction = 0
+            time.sleep(0.001)
+            continue
+
+        new_direction = 1 if current_speed_signed > 0 else -1
+        if new_direction != current_direction:
+            act_set_direction(new_direction)
+            current_direction = new_direction
+            act_enable()
+
+        with _actuator_lock:
+            at_max = (
+                current_direction > 0
+                and _actuator_position >= ACTUATOR_MAX_POSITION
+            )
+            at_min = (
+                current_direction < 0
+                and _actuator_position <= ACTUATOR_MIN_POSITION
+            )
+
+        if at_max or at_min:
+            # HARD LIMIT -- previously nothing here ever checked
+            # ACTUATOR_MIN/MAX_POSITION during normal tracking; only an
+            # unrelated, not-yet-active feedforward function referenced
+            # them at all. Without this, a persistent tracking error in
+            # one direction (or the position-desync bug fixed above)
+            # would drive the actuator into its mechanical end stop and
+            # keep pushing, with no software stopping it. Refuse to
+            # step further in that direction; let it still decelerate
+            # and reverse normally in the other direction.
+            current_speed_signed = 0.0
+            current_direction = 0
+            time.sleep(0.001)
+            continue
+
+        delay = act_delay_from_speed(abs(current_speed_signed))
         act_step_once(delay)
+
+        with _actuator_lock:
+            _actuator_position += current_direction
+
+
+def actuator_set_target_speed(signed_speed):
+    global _actuator_target_speed_signed
+    with _actuator_lock:
+        _actuator_target_speed_signed = signed_speed
+
+
+def actuator_get_position():
+    with _actuator_lock:
+        return _actuator_position
+
+
+def actuator_get_speed():
+    return _actuator_current_speed_signed
 
 
 # ============================================================
 # LASER DETECTION
-#
-# Largest bright blob wins, no continuity gating.
 # ============================================================
 
 def detect_laser(frame):
 
-    gray = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2GRAY
-    )
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mask = cv2.inRange(gray, BRIGHTNESS_MIN, BRIGHTNESS_MAX)
 
-    mask = cv2.inRange(
-        gray,
-        BRIGHTNESS_MIN,
-        BRIGHTNESS_MAX
-    )
-
-    kernel = np.ones(
-        (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE),
-        np.uint8
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        kernel
-    )
+    kernel = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
     contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
     best = None
     best_area = 0
 
     for contour in contours:
-
         area = cv2.contourArea(contour)
-
         if area < MIN_BLOB_AREA:
             continue
-
         if area > best_area:
             best = contour
             best_area = area
@@ -833,7 +877,6 @@ def detect_laser(frame):
         return None, None, 0, mask, len(contours)
 
     M = cv2.moments(best)
-
     if M["m00"] == 0:
         return None, None, 0, mask, len(contours)
 
@@ -844,149 +887,186 @@ def detect_laser(frame):
 
 
 # ============================================================
-# MOUSE
+# TARGET / QUEUE
 # ============================================================
 
 target_x = None
 target_y = None
 target_state = "IDLE"
-# One of: IDLE, TRACKING, JITTERING, SETTLED
+# One of: IDLE, TRACKING, JITTERING, SETTLED, SEARCHING
 
 pending_targets = []
-# Queue of (x, y) tuples clicked but not yet active. Filled by
-# clicking before pressing G; consumed one at a time once the
-# sequence is running.
-
 sequence_running = False
-# True from the moment G is pressed until the queue is empty
-# and the last target has settled.
 
 
-def mouse_callback(
-    event,
-    x,
-    y,
-    flags,
-    param
-):
+def mouse_callback(event, x, y, flags, param):
 
-    global pending_targets
-    global sequence_running
+    global pending_targets, sequence_running
 
     if event == cv2.EVENT_LBUTTONDOWN:
 
         if sequence_running:
-
             print()
-            print(
-                "[QUEUE] Sequence already running -- "
-                "press C to cancel before queuing new targets"
-            )
-
+            print("[QUEUE] Sequence already running -- press C to cancel first")
             return
 
         pending_targets.append((x, y))
-
         print()
-        print(
-            f"[QUEUE] Added target #{len(pending_targets)}: "
-            f"x={x}, y={y}"
-        )
+        print(f"[QUEUE] Added target #{len(pending_targets)}: x={x}, y={y}")
 
 
 # ============================================================
-# DRAW LASER
+# DRAWING
 # ============================================================
 
 def draw_laser(output, laser_x, laser_y):
-
     if laser_x is None:
         return
-
-    x = int(laser_x)
-    y = int(laser_y)
-
+    x, y = int(laser_x), int(laser_y)
     cv2.circle(output, (x, y), 8, (0, 0, 255), -1)
-
-    cv2.drawMarker(
-        output, (x, y), (0, 0, 255),
-        cv2.MARKER_CROSS, 30, 2
-    )
-
+    cv2.drawMarker(output, (x, y), (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
     cv2.putText(
         output, f"Laser: ({x}, {y})", (x + 15, y),
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
     )
 
 
-# ============================================================
-# DRAW TARGET
-# ============================================================
-
 def draw_target(output, target_x, target_y, laser_x):
-
     if target_x is None:
         return
-
-    x = int(target_x)
-    y = int(target_y)
-
-    cv2.drawMarker(
-        output, (x, y), (255, 0, 0),
-        cv2.MARKER_CROSS, 30, 2
-    )
-
+    x, y = int(target_x), int(target_y)
+    cv2.drawMarker(output, (x, y), (255, 0, 0), cv2.MARKER_CROSS, 30, 2)
     cv2.putText(
         output, f"Target: ({x}, {y})", (x + 15, y + 30),
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2
     )
-
     if laser_x is not None:
+        cv2.line(output, (int(laser_x), y), (x, y), (255, 255, 0), 2)
 
-        lx = int(laser_x)
-
-        cv2.line(output, (lx, y), (x, y), (255, 255, 0), 2)
-
-
-# ============================================================
-# DRAW QUEUE
-# ============================================================
 
 def draw_queue(output, pending_targets):
-
     for i, (x, y) in enumerate(pending_targets):
-
         cv2.circle(output, (x, y), 6, (0, 165, 255), 2)
-
         cv2.putText(
             output, str(i + 1), (x + 8, y - 8),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1
         )
 
 
-# ============================================================
-# DRAW TUNED PARAMETERS
-#
-# Bakes the active tunable settings into the corner of the
-# recorded video (and live window), so a saved clip is always
-# self-describing without needing to cross-reference the code
-# or the separate params CSV.
-# ============================================================
-
 def draw_params_overlay(output, params):
-
-    x0 = output.shape[1] - 280
+    x0 = output.shape[1] - 300
     y0 = 20
     line_height = 15
-
     for i, (key, value) in enumerate(params.items()):
-
-        text = f"{key}={value}"
-
         cv2.putText(
-            output, text, (x0, y0 + i * line_height),
+            output, f"{key}={value}", (x0, y0 + i * line_height),
             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1
         )
+
+
+def get_vehicle_pose():
+
+    # Returns (x, y, yaw_rad) in the odom/world frame, or None if
+    # unavailable (file missing, malformed, or stale). Callers MUST
+    # treat None as "hold current aim, don't apply feedforward this
+    # frame" -- never fall back to a guessed pose.
+
+    try:
+        with open(VEHICLE_POSE_FILE) as f:
+            line = f.read().strip()
+        parts = line.split()
+        if len(parts) != 4:
+            return None
+        x, y, yaw, ts = (float(p) for p in parts)
+        if time.time() - ts > VEHICLE_POSE_MAX_AGE_S:
+            return None
+        return (x, y, yaw)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def azimuth_from_servo(servo_position):
+    return math.radians(
+        (servo_position - ST_MIDDLE_POSITION) * AZIMUTH_DEG_PER_SERVO_UNIT
+        + MOUNT_YAW_OFFSET_DEG
+    )
+
+
+def servo_from_azimuth(azimuth_rad):
+    deg = math.degrees(azimuth_rad) - MOUNT_YAW_OFFSET_DEG
+    return ST_MIDDLE_POSITION + deg / AZIMUTH_DEG_PER_SERVO_UNIT
+
+
+def elevation_from_actuator(actuator_position):
+    return math.radians(
+        ELEVATION_HOME_DEG + actuator_position * ELEVATION_DEG_PER_ACTUATOR_STEP
+    )
+
+
+def actuator_from_elevation(elevation_rad):
+    deg = math.degrees(elevation_rad) - ELEVATION_HOME_DEG
+    position = deg / ELEVATION_DEG_PER_ACTUATOR_STEP
+    return max(ACTUATOR_MIN_POSITION, min(ACTUATOR_MAX_POSITION, position))
+
+
+def mount_world_position(vehicle_pose):
+    vx, vy, vyaw = vehicle_pose
+    mount_x = (
+        vx + MOUNT_FORWARD_OFFSET_M * math.cos(vyaw)
+        - MOUNT_LATERAL_OFFSET_M * math.sin(vyaw)
+    )
+    mount_y = (
+        vy + MOUNT_FORWARD_OFFSET_M * math.sin(vyaw)
+        + MOUNT_LATERAL_OFFSET_M * math.cos(vyaw)
+    )
+    return mount_x, mount_y
+
+
+def compute_world_lock_point(vehicle_pose, servo_position, actuator_position):
+
+    # Ray-casts the CURRENT aim direction (servo -> azimuth, actuator ->
+    # elevation) from the mount onto the assumed flat ground plane, to
+    # get a world-frame (x, y). Only meaningful to call when the laser
+    # is actually sitting on the real target (i.e. SETTLED) -- this
+    # trusts the current aim as ground truth.
+
+    mount_x, mount_y = mount_world_position(vehicle_pose)
+
+    azimuth = vehicle_pose[2] + azimuth_from_servo(servo_position)
+    elevation = elevation_from_actuator(actuator_position)
+
+    if elevation <= math.radians(1.0):
+        return None  # aimed at/above the horizon -- no ground intersection
+
+    ground_range = MOUNT_HEIGHT_M / math.tan(elevation)
+
+    return (
+        mount_x + ground_range * math.cos(azimuth),
+        mount_y + ground_range * math.sin(azimuth),
+    )
+
+
+def compute_feedforward_aim(vehicle_pose, world_x, world_y):
+
+    # Given the CURRENT vehicle pose and a locked world-frame ground
+    # point, returns the (servo_position, actuator_position) that keeps
+    # pointing at it right now.
+
+    mount_x, mount_y = mount_world_position(vehicle_pose)
+
+    dx = world_x - mount_x
+    dy = world_y - mount_y
+    ground_range = math.hypot(dx, dy)
+
+    world_azimuth = math.atan2(dy, dx)
+    azimuth = world_azimuth - vehicle_pose[2]
+
+    elevation = math.atan2(MOUNT_HEIGHT_M, ground_range)
+
+    servo_pos = servo_from_azimuth(azimuth)
+    servo_pos = max(ST_VISIBLE_MIN_POSITION, min(ST_VISIBLE_MAX_POSITION, servo_pos))
+
+    return servo_pos, actuator_from_elevation(elevation)
 
 
 # ============================================================
@@ -995,45 +1075,48 @@ def draw_params_overlay(output, params):
 
 def main():
 
-    global target_x
-    global target_y
-    global target_state
-    global pending_targets
-    global sequence_running
-    global CONTROL_AXIS
+    global target_x, target_y, target_state, pending_targets, sequence_running
+    global CONTROL_AXIS, _actuator_running
+    global ST_VISIBLE_MIN_POSITION, ST_VISIBLE_MAX_POSITION
+    global ACTUATOR_MIN_POSITION, ACTUATOR_MAX_POSITION
+
+    load_calibration()
 
     cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
-
     if not cap.isOpened():
-        raise RuntimeError(
-            f"Could not open camera /dev/video{CAMERA_DEVICE}"
-        )
+        raise RuntimeError(f"Could not open camera /dev/video{CAMERA_DEVICE}")
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, FRAME_FPS)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-
     time.sleep(0.5)
 
     print()
     print("==========================================")
-    print(" LASER + SERVO CONTROLLER")
+    print(" LASER + ST3215 SERVO + LINEAR ACTUATOR")
     print("==========================================")
     print()
-    print(f"Camera       : /dev/video{CAMERA_DEVICE}")
-    print(f"Resolution   : {FRAME_WIDTH}x{FRAME_HEIGHT}")
-    print(f"PWM          : {PWM_PATH}")
-    print(f"Pulse range  : {MIN_PULSE_US}-{MAX_PULSE_US} us")
-    print(f"Actuator pins: STEP={ACT_STEP_PIN} DIR={ACT_DIR_PIN} EN={ACT_EN_PIN}")
+    print(f"Camera         : /dev/video{CAMERA_DEVICE}")
+    print(f"Resolution     : {FRAME_WIDTH}x{FRAME_HEIGHT}")
+    print(f"ST3215 port    : {ST_SERIAL_PORT} @ {ST_BAUDRATE} baud, ID {ST_SERVO_ID}")
+    print(f"Actuator pins  : STEP={ACT_STEP_PIN} DIR={ACT_DIR_PIN} EN={ACT_EN_PIN}")
     print()
     print("CONTROLS")
     print("  Left click  = queue a target")
     print("  G           = go -- start tracking the queued targets in order")
     print("  A           = switch servo's control axis (X <-> Y) --")
     print("                the actuator automatically follows the other axis")
-    print("  R           = neutral (also clears queue)")
-    print("  C           = cancel current target / sequence / queue")
+    print("  L           = lock current (SETTLED) target to world frame --")
+    print("                keeps pointing at it as the vehicle moves")
+    print("  R           = neutral (also clears queue and world-lock)")
+    print("  C           = cancel current target / sequence / queue / world-lock / sweep")
+    print("  M           = toggle jog mode (only when no target is active)")
+    print("                  I/K = jog servo -/+        U/O = jog actuator -/+")
+    print("                  1/2 = mark servo MIN/MAX   3/4 = mark actuator MIN/MAX")
+    print("                  (each mark saves to " + CALIBRATION_FILE + " immediately)")
+    print("  T           = sweep test -- walk both axes MIN->MAX to verify calibration")
+    print("  J           = manually trigger jitter at the current position")
     print("  Q           = quit")
     print()
     print(f"Starting axis  : servo={CONTROL_AXIS.upper()}  "
@@ -1043,10 +1126,34 @@ def main():
     print(f"Params file    : {PARAMS_LOG_FILE}")
     print()
 
-    setup_pwm()
-    act_enable()
+    setup_st_servo()
 
-    pulse_us = float(NEUTRAL_PULSE_US)
+    true_position = st_servo.ReadPosition(ST_SERVO_ID)
+    if true_position is not None:
+        servo_position = float(true_position)
+        print(f"[ST3215] Read true starting position: {true_position}")
+    else:
+        servo_position = float(ST_MIDDLE_POSITION)
+        print(
+            "[ST3215] WARNING: could not read true position -- "
+            f"assuming middle ({ST_MIDDLE_POSITION}). If the servo was "
+            "NOT actually at middle, the first correction will be "
+            "computed from a wrong baseline and may move further/faster "
+            "than intended."
+        )
+    # No set_servo_position() call here on purpose -- previously this
+    # unconditionally commanded a snap to ST_MIDDLE_POSITION on every
+    # startup, regardless of where the servo physically was. That's an
+    # immediate, uncommanded jump before any target is even selected,
+    # and it also seeded all of TRACKING's *relative* correction math
+    # (servo_position += correction) from a value that may not match
+    # reality -- both compounding into the "abrupt movement" you're
+    # seeing. The servo now stays wherever it actually is until you
+    # either select a target or press R.
+
+    act_enable()
+    actuator_thread = threading.Thread(target=actuator_thread_loop, daemon=True)
+    actuator_thread.start()
 
     setup_logging()
     setup_extra_logging()
@@ -1058,7 +1165,6 @@ def main():
 
     WINDOW_NAME = "Camera + Laser + Servo"
     RAW_WINDOW = "Raw Camera"
-
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.namedWindow(RAW_WINDOW, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
@@ -1066,105 +1172,56 @@ def main():
 
     tracking = False
     frame_number = 0
-
     fps = 0
     fps_count = 0
     fps_start = time.monotonic()
-
     last_servo_update = 0
 
     filtered_x = None
-
     laser_last_seen = None
-    # Timestamp the laser was last actually detected. Used to notice
-    # when it's gone missing long enough to mean "off the edge of
-    # the frame" rather than a one-frame detection blip.
 
     jitter_start_time = None
-    jitter_base_pulse = None
+    jitter_base_position = None
     settled_since = None
-    target_center_pulse = None
-
     settle_dwell_start = None
-    # When the servo's error first entered SETTLE_DEADBAND_PX,
-    # continuously. Reset to None any time the error leaves the
-    # deadband. Reaching SETTLE_DWELL_S after this timestamp is
-    # required (alongside the actuator also being SETTLED) before
-    # the target actually counts as reached.
-
-    actuator_position = 0
-    # Step count relative to wherever the actuator happened to be
-    # when this script started -- see the caveat in the LINEAR
-    # ACTUATOR section above. Used as this axis's own "home".
 
     actuator_filtered = None
     actuator_state = "IDLE"
-    # One of: IDLE, TRACKING, SETTLED. No JITTERING of its own --
-    # jitter wasn't asked for on this axis and rapid direction
-    # reversals are harder on a leadscrew/stepper than a hobby
-    # servo, so it's deliberately left out for now. Laser-lost
-    # recovery IS shared with the servo, via the existing
-    # target_state == "SEARCHING" check below -- that condition
-    # (is the laser visible at all) isn't axis-specific, so this
-    # reads it without needing to touch how the servo sets it.
-
     actuator_settle_dwell_start = None
-    # Same dwell-timer idea as settle_dwell_start above, but for
-    # the actuator's own axis.
 
-    actuator_speed = 0.0
-    # Current commanded speed (steps/sec), persisted across frames
-    # and ramped toward each frame's target speed by at most
-    # ACT_ACCELERATION_STEPS_S2 * dt -- see act_target_speed().
-    # Reset to 0 any time the actuator isn't actively correcting
-    # (it isn't physically moving then, so there's no real speed
-    # to carry over) and on a direction reversal (must pass
-    # through zero speed before turning around).
-
-    actuator_last_direction = 0
-    actuator_last_update = None
-    # Wall-clock time of the last actuator update, used to get a
-    # real dt for the speed ramp above rather than assuming a
-    # fixed frame time (your loop's fps isn't constant).
+    world_lock_active = False
+    world_lock_x = None
+    world_lock_y = None
 
     # --------------------------------------------------------
-    # Reaching a target either advances to the next queued
-    # target, or settles (with the sequence-complete message)
-    # if the queue is empty. Both the "jitter finished" path
-    # and the "jitter disabled" path call this -- previously
-    # this logic lived ONLY inside the JITTERING branch, so
-    # disabling jitter meant the queue never advanced past the
-    # first target.
+    # Jog / calibration / sweep-test state
     # --------------------------------------------------------
+
+    actuator_jog_until = 0.0
+    jog_mode = False
+
+    sweep_active = False
+    sweep_leg = None
+    # "to_min", "to_max", or None (idle). One full min->max->min pass
+    # per T press; press T or C again to abort early.
 
     def advance_or_settle():
 
-        nonlocal filtered_x
-        nonlocal settled_since
-
-        global target_x
-        global target_y
-        global target_state
-        global sequence_running
+        nonlocal filtered_x, settled_since
+        global target_x, target_y, target_state, sequence_running
 
         if sequence_running and pending_targets:
-
             target_x, target_y = pending_targets.pop(0)
             target_state = "IDLE"
             filtered_x = None
-
             print()
             print(
-                f"[SEQUENCE] Advancing to "
-                f"x={target_x}, y={target_y} "
+                f"[SEQUENCE] Advancing to x={target_x}, y={target_y} "
                 f"({len(pending_targets)} remaining)"
             )
-
         else:
-
             target_state = "SETTLED"
             settled_since = time.monotonic()
-
             if sequence_running:
                 sequence_running = False
                 print()
@@ -1175,28 +1232,52 @@ def main():
         while True:
 
             frame_number += 1
-
             ret, frame = cap.read()
-
             if not ret:
                 print("[CAMERA] Failed to read frame")
                 continue
 
-            # ------------------------------------------------
-            # Laser detection
-            # ------------------------------------------------
-
-            (
-                laser_x, laser_y, blob_area, mask, num_contours
-            ) = detect_laser(frame)
-
-            # ------------------------------------------------
-            # Control
-            # ------------------------------------------------
+            laser_x, laser_y, blob_area, mask, num_contours = detect_laser(frame)
 
             error_x = None
-            correction = None
-            jitter_offset = None
+            vehicle_pose = None
+
+            # ------------------------------------------------
+            # World-frame lock (odometry-driven feedforward)
+            #
+            # Bypasses the pixel-based blocks below entirely -- locking
+            # (the L key) clears target_x/target_y, so those blocks'
+            # own "if target_x is not None" guards naturally go inert.
+            # No vision trim blended in yet -- see the design notes.
+            # ------------------------------------------------
+
+            if world_lock_active:
+
+                vehicle_pose = get_vehicle_pose()
+
+                if vehicle_pose is not None:
+
+                    ff_servo_pos, ff_actuator_pos = compute_feedforward_aim(
+                        vehicle_pose, world_lock_x, world_lock_y
+                    )
+
+                    servo_position = set_servo_position(ff_servo_pos)
+
+                    remaining_actuator_steps = (
+                        ff_actuator_pos - actuator_get_position()
+                    )
+                    ff_speed = act_target_speed(abs(remaining_actuator_steps))
+                    actuator_set_target_speed(
+                        math.copysign(ff_speed, remaining_actuator_steps)
+                        if remaining_actuator_steps != 0 else 0.0
+                    )
+
+                # else: no fresh pose -- hold last commanded aim, do
+                # nothing this frame (see get_vehicle_pose()'s contract).
+
+            # ------------------------------------------------
+            # ST3215 servo control
+            # ------------------------------------------------
 
             if target_x is not None:
 
@@ -1215,41 +1296,25 @@ def main():
                 if target_state == "SEARCHING":
 
                     if laser_x is not None:
-                        # Found it again -- resume normal tracking
-                        # from here, wherever "here" turned out to be.
                         target_state = "TRACKING"
                         filtered_x = None
                         settle_dwell_start = None
                     else:
                         recovery_target = (
-                            SERVO_VISIBLE_MIN_PULSE_US
-                            + SERVO_VISIBLE_MAX_PULSE_US
+                            ST_VISIBLE_MIN_POSITION + ST_VISIBLE_MAX_POSITION
                         ) / 2
-                        # Sweeps toward the middle of the calibrated
-                        # VISIBLE range, not NEUTRAL_PULSE_US -- the
-                        # servo's mechanical rest position has no
-                        # guaranteed relationship to where the camera
-                        # is actually pointed, and sweeping toward a
-                        # wrong assumed "center" here was the likely
-                        # cause of recovery driving the laser further
-                        # out of frame instead of back into it.
-                        if pulse_us > recovery_target:
-                            pulse_us = max(
-                                recovery_target, pulse_us - RECOVERY_STEP_US
+                        if servo_position > recovery_target:
+                            servo_position = max(
+                                recovery_target, servo_position - RECOVERY_STEP_POS
                             )
-                        elif pulse_us < recovery_target:
-                            pulse_us = min(
-                                recovery_target, pulse_us + RECOVERY_STEP_US
+                        elif servo_position < recovery_target:
+                            servo_position = min(
+                                recovery_target, servo_position + RECOVERY_STEP_POS
                             )
-                        set_pulse_us(pulse_us)
+                        servo_position = set_servo_position(servo_position)
 
                 if target_state == "IDLE" and laser_x is not None:
                     target_state = "TRACKING"
-
-                # TRACKING always re-evaluates. SETTLED also
-                # re-evaluates, but only once SETTLE_GRACE_PERIOD_S
-                # has passed since settling -- see the constant's
-                # comment for why the grace period exists.
 
                 settled_grace_elapsed = (
                     target_state != "SETTLED"
@@ -1266,8 +1331,6 @@ def main():
 
                 if can_update:
 
-                    # Which coordinate of the laser/target this
-                    # single servo is currently following.
                     laser_pos = laser_x if CONTROL_AXIS == "x" else laser_y
                     target_pos = target_x if CONTROL_AXIS == "x" else target_y
 
@@ -1275,16 +1338,12 @@ def main():
                         laser_pos if filtered_x is None
                         else ALPHA * laser_pos + (1 - ALPHA) * filtered_x
                     )
-
                     error_x = target_pos - filtered_x
 
                     if target_state == "SETTLED":
-
                         if abs(error_x) > RETRACK_DEADBAND_PX:
-                            # Drifted far enough to resume tracking.
                             target_state = "TRACKING"
-                        # else: still within the looser retrack band --
-                        # hold still, no correction below.
+                            settle_dwell_start = None
 
                     if target_state == "TRACKING":
 
@@ -1292,26 +1351,21 @@ def main():
 
                             tracking = False
 
-                            # One last small correction to close the
-                            # remaining (sub-deadband) error before
-                            # freezing/jittering, so the jitter/settle
-                            # center is the best estimate of the true
-                            # target pulse -- not just wherever the
-                            # P-controller happened to stop inside the
-                            # deadband.
                             fine_correction = max(
-                                -MAX_STEP_US,
+                                -MAX_POSITION_STEP_PER_UPDATE,
                                 min(
-                                    MAX_STEP_US,
-                                    error_x * AXIS_GAIN_US_PER_PX[CONTROL_AXIS]
+                                    MAX_POSITION_STEP_PER_UPDATE,
+                                    error_x * AXIS_GAIN_POS_PER_PX[CONTROL_AXIS]
                                 )
                             )
-                            pulse_us += AXIS_SIGN[CONTROL_AXIS] * fine_correction
-                            pulse_us = max(
-                                SERVO_VISIBLE_MIN_PULSE_US,
-                                min(SERVO_VISIBLE_MAX_PULSE_US, pulse_us)
+                            servo_position += AXIS_SIGN[CONTROL_AXIS] * fine_correction
+                            servo_position = max(
+                                ST_VISIBLE_MIN_POSITION,
+                                min(ST_VISIBLE_MAX_POSITION, servo_position)
                             )
-                            set_pulse_us(pulse_us)
+                            servo_position = set_servo_position(
+                                servo_position, speed=scaled_servo_speed(error_x)
+                            )
 
                             if settle_dwell_start is None:
                                 settle_dwell_start = time.monotonic()
@@ -1321,16 +1375,6 @@ def main():
                                 >= SETTLE_DWELL_S
                             )
 
-                            # Both conditions required: this axis has
-                            # sat inside the deadband continuously for
-                            # SETTLE_DWELL_S (not just touched it on
-                            # one frame while passing through), AND
-                            # the actuator's axis has independently
-                            # reached its own SETTLED state. Until
-                            # both are true, hold here (already
-                            # fine-nudged above) and re-check next
-                            # frame -- don't jitter/advance yet.
-
                             if dwelled_long_enough and actuator_state == "SETTLED":
 
                                 settle_dwell_start = None
@@ -1338,7 +1382,7 @@ def main():
                                 if JITTER_ENABLE:
                                     target_state = "JITTERING"
                                     jitter_start_time = time.monotonic()
-                                    jitter_base_pulse = pulse_us
+                                    jitter_base_position = servo_position
                                 else:
                                     advance_or_settle()
 
@@ -1347,72 +1391,53 @@ def main():
                             tracking = True
                             settle_dwell_start = None
 
-                            desired = error_x * AXIS_GAIN_US_PER_PX[CONTROL_AXIS]
-
+                            desired = error_x * AXIS_GAIN_POS_PER_PX[CONTROL_AXIS]
                             correction = max(
-                                -MAX_STEP_US,
-                                min(MAX_STEP_US, desired)
+                                -MAX_POSITION_STEP_PER_UPDATE,
+                                min(MAX_POSITION_STEP_PER_UPDATE, desired)
                             )
 
-                            pulse_us += AXIS_SIGN[CONTROL_AXIS] * correction
-                            pulse_us = max(
-                                SERVO_VISIBLE_MIN_PULSE_US,
-                                min(SERVO_VISIBLE_MAX_PULSE_US, pulse_us)
+                            servo_position += AXIS_SIGN[CONTROL_AXIS] * correction
+                            servo_position = max(
+                                ST_VISIBLE_MIN_POSITION,
+                                min(ST_VISIBLE_MAX_POSITION, servo_position)
                             )
-
-                            set_pulse_us(pulse_us)
+                            servo_position = set_servo_position(
+                                servo_position, speed=scaled_servo_speed(error_x)
+                            )
 
                     last_servo_update = time.monotonic()
 
                 elif target_state == "JITTERING":
 
-                    # Jitter is a deliberate motion, independent of
-                    # whether the laser happens to be detected this
-                    # exact frame -- it doesn't need laser_x.
-
                     elapsed = time.monotonic() - jitter_start_time
 
                     if elapsed >= JITTER_DURATION_S:
-
-                        pulse_us = jitter_base_pulse
-                        set_pulse_us(pulse_us)
-
+                        servo_position = set_servo_position(jitter_base_position)
                         advance_or_settle()
-
                     else:
-
-                        sine_component = JITTER_AMPLITUDE_US * math.sin(
+                        sine_component = ST_JITTER_AMPLITUDE_POS * math.sin(
                             2 * math.pi * JITTER_FREQUENCY_HZ * elapsed
                         )
-                        noise_component = JITTER_AMPLITUDE_US * random.uniform(-1, 1)
-
+                        noise_component = ST_JITTER_AMPLITUDE_POS * random.uniform(-1, 1)
                         jitter_offset = (
                             (1 - JITTER_RANDOMNESS) * sine_component
                             + JITTER_RANDOMNESS * noise_component
                         )
-
-                        jitter_pulse = jitter_base_pulse + jitter_offset
-                        jitter_pulse = max(
-                            SERVO_VISIBLE_MIN_PULSE_US,
-                            min(SERVO_VISIBLE_MAX_PULSE_US, jitter_pulse)
+                        jitter_pos = jitter_base_position + jitter_offset
+                        jitter_pos = max(
+                            ST_VISIBLE_MIN_POSITION,
+                            min(ST_VISIBLE_MAX_POSITION, jitter_pos)
                         )
-
-                        set_pulse_us(jitter_pulse)
-                        pulse_us = jitter_pulse
-
-                # SETTLED (within the retrack band): nothing to do --
-                # servo holds still, no re-actuation, no oscillation.
+                        set_servo_position(jitter_pos)
 
             # ------------------------------------------------
-            # Actuator control (second DOF)
-            #
-            # Fully independent of the servo block above -- own
-            # state variable, own error, own deadbands. Drives
-            # whichever axis CONTROL_AXIS is NOT currently on.
+            # Actuator control (second DOF) -- computes target
+            # speed only; actuator_thread_loop() does the actual
+            # stepping continuously, independent of this loop's fps.
             # ------------------------------------------------
 
             actuator_error = None
-            actuator_correction = None
 
             if target_x is not None:
 
@@ -1422,39 +1447,17 @@ def main():
 
                 if target_state == "SEARCHING":
 
-                    # Shares the servo's laser-lost trigger (that
-                    # condition is "is the laser visible at all",
-                    # not axis-specific) -- sweep this axis back
-                    # toward its own home (step 0) too, at a fixed
-                    # moderate speed (no target to ramp toward, and
-                    # bursts here are short anyway).
-
-                    if actuator_position > 0:
-                        step_this_frame = min(
-                            ACT_MAX_STEPS_PER_FRAME, actuator_position
-                        )
-                        act_move_steps(
-                            step_this_frame, -1,
-                            act_delay_from_speed(ACT_RECOVERY_SPEED_STEPS_S)
-                        )
-                        actuator_position -= step_this_frame
-
-                    elif actuator_position < 0:
-                        step_this_frame = min(
-                            ACT_MAX_STEPS_PER_FRAME, -actuator_position
-                        )
-                        act_move_steps(
-                            step_this_frame, +1,
-                            act_delay_from_speed(ACT_RECOVERY_SPEED_STEPS_S)
-                        )
-                        actuator_position += step_this_frame
+                    pos = actuator_get_position()
+                    if pos > 0:
+                        actuator_set_target_speed(-ACT_RECOVERY_SPEED_STEPS_S)
+                    elif pos < 0:
+                        actuator_set_target_speed(ACT_RECOVERY_SPEED_STEPS_S)
+                    else:
+                        actuator_set_target_speed(0.0)
 
                     actuator_state = "IDLE"
                     actuator_filtered = None
                     actuator_settle_dwell_start = None
-                    actuator_speed = 0.0
-                    actuator_last_direction = 0
-                    actuator_last_update = None
 
                 elif actuator_laser_pos is not None:
 
@@ -1466,11 +1469,9 @@ def main():
                         else ALPHA * actuator_laser_pos
                         + (1 - ALPHA) * actuator_filtered
                     )
-
                     actuator_error = actuator_target_pos - actuator_filtered
 
                     if actuator_state == "SETTLED":
-
                         if abs(actuator_error) > ACT_RETRACK_DEADBAND_PX:
                             actuator_state = "TRACKING"
                             actuator_settle_dwell_start = None
@@ -1479,18 +1480,7 @@ def main():
 
                         if abs(actuator_error) <= ACT_SETTLE_DEADBAND_PX:
 
-                            # Same dwell idea as the servo: don't
-                            # mark this axis SETTLED off a single
-                            # lucky frame -- require it to sit inside
-                            # the deadband continuously for
-                            # SETTLE_DWELL_S first. Issue no further
-                            # steps while waiting; it's already
-                            # inside the deadband. Not physically
-                            # moving, so there's no speed to carry.
-
-                            actuator_speed = 0.0
-                            actuator_last_direction = 0
-                            actuator_last_update = None
+                            actuator_set_target_speed(0.0)
 
                             if actuator_settle_dwell_start is None:
                                 actuator_settle_dwell_start = time.monotonic()
@@ -1506,95 +1496,99 @@ def main():
 
                             actuator_settle_dwell_start = None
 
-                            desired_steps = (
-                                actuator_error * ACT_GAIN_STEPS_PER_PX
+                            remaining_steps = (
+                                abs(actuator_error) * ACT_GAIN_STEPS_PER_PX
+                            )
+                            speed = max(
+                                ACT_MIN_TRACKING_SPEED_STEPS_S,
+                                act_target_speed(remaining_steps)
                             )
 
-                            actuator_correction = max(
-                                -ACT_MAX_STEPS_PER_FRAME,
-                                min(ACT_MAX_STEPS_PER_FRAME, desired_steps)
+                            signed_speed = (
+                                math.copysign(speed, actuator_error) * ACT_SIGN
                             )
+                            actuator_set_target_speed(signed_speed)
 
-                            steps_this_frame_target = int(round(
-                                ACT_SIGN * actuator_correction
-                            ))
+            # ------------------------------------------------
+            # Jog mode: actuator jog pulse auto-stop
+            #
+            # Runs every frame regardless of target state -- U/O each
+            # issue a short timed speed pulse (steppers are speed-
+            # driven, not position-driven, and cv2.waitKey only gives
+            # discrete keypress events, not "key held" state), and
+            # this is what cuts that pulse off again once it expires.
+            # ------------------------------------------------
 
-                            if steps_this_frame_target != 0:
+            if (
+                jog_mode
+                and target_x is None
+                and not sweep_active
+                and actuator_jog_until
+                and time.monotonic() >= actuator_jog_until
+            ):
+                actuator_set_target_speed(0.0)
+                actuator_jog_until = 0.0
 
-                                direction = (
-                                    1 if steps_this_frame_target > 0 else -1
-                                )
+            # ------------------------------------------------
+            # Sweep test: slowly walks each axis between its saved
+            # calibrated endpoints and back, so you can visually
+            # confirm the saved numbers are actually the physical
+            # limits you meant, before trusting the hard clamp with a
+            # real target. Uses IsMoving() to know when each leg is
+            # done rather than guessing a duration.
+            # ------------------------------------------------
 
-                                # Must pass through zero speed before
-                                # reversing -- can't be moving both
-                                # ways at once, and an instant
-                                # direction flip at speed is exactly
-                                # the kind of shock that skips steps.
-                                if (
-                                    actuator_last_direction != 0
-                                    and direction != actuator_last_direction
-                                ):
-                                    actuator_speed = 0.0
+            if sweep_active:
 
-                                now = time.monotonic()
-                                dt = (
-                                    now - actuator_last_update
-                                    if actuator_last_update is not None
-                                    else 0.0
-                                )
-                                actuator_last_update = now
-                                actuator_last_direction = direction
+                servo_arrived = not st_servo.IsMoving(ST_SERVO_ID)
+                actuator_arrived = abs(actuator_get_position() - (
+                    ACTUATOR_MIN_POSITION if sweep_leg == "to_min"
+                    else ACTUATOR_MAX_POSITION
+                )) <= 20
 
-                                remaining_steps = (
-                                    abs(actuator_error) * ACT_GAIN_STEPS_PER_PX
-                                )
-                                target_speed = act_target_speed(remaining_steps)
+                if sweep_leg == "to_min":
+                    if servo_position != ST_VISIBLE_MIN_POSITION:
+                        servo_position = set_servo_position(
+                            ST_VISIBLE_MIN_POSITION, speed=SERVO_SPEED_NEAR
+                        )
+                    actuator_set_target_speed(
+                        -ACT_RECOVERY_SPEED_STEPS_S if not actuator_arrived else 0.0
+                    )
+                    if servo_arrived and actuator_arrived:
+                        sweep_leg = "to_max"
 
-                                max_change = ACT_ACCELERATION_STEPS_S2 * dt
-                                speed_diff = target_speed - actuator_speed
-
-                                if abs(speed_diff) <= max_change:
-                                    actuator_speed = target_speed
-                                else:
-                                    actuator_speed += math.copysign(
-                                        max_change, speed_diff
-                                    )
-
-                                # Never exceed what the ramped speed
-                                # allows in this frame's dt, and never
-                                # exceed the estimated remaining gap
-                                # (steps_this_frame_target) either --
-                                # whichever is smaller wins.
-                                steps_this_frame = min(
-                                    abs(steps_this_frame_target),
-                                    max(0, int(round(actuator_speed * dt)))
-                                )
-
-                                step_delay = act_delay_from_speed(
-                                    actuator_speed
-                                )
-
-                                if steps_this_frame > 0 and step_delay is not None:
-
-                                    act_move_steps(
-                                        steps_this_frame, direction, step_delay
-                                    )
-
-                                    actuator_position += (
-                                        direction * steps_this_frame
-                                    )
+                elif sweep_leg == "to_max":
+                    if servo_position != ST_VISIBLE_MAX_POSITION:
+                        servo_position = set_servo_position(
+                            ST_VISIBLE_MAX_POSITION, speed=SERVO_SPEED_NEAR
+                        )
+                    actuator_set_target_speed(
+                        ACT_RECOVERY_SPEED_STEPS_S if not actuator_arrived else 0.0
+                    )
+                    if servo_arrived and actuator_arrived:
+                        sweep_active = False
+                        sweep_leg = None
+                        actuator_set_target_speed(0.0)
+                        print()
+                        print("[SWEEP] Complete")
 
             # ------------------------------------------------
             # Output image
             # ------------------------------------------------
 
             output = frame.copy()
-
             draw_laser(output, laser_x, laser_y)
             draw_target(output, target_x, target_y, laser_x)
             draw_queue(output, pending_targets)
 
-            if target_state == "SEARCHING":
+            if world_lock_active:
+                if vehicle_pose is None:
+                    status = "WORLD-LOCK -- NO VEHICLE POSE (holding last aim)"
+                    status_color = (0, 165, 255)
+                else:
+                    status = f"WORLD-LOCK ({world_lock_x:.2f}, {world_lock_y:.2f})"
+                    status_color = (255, 0, 255)
+            elif target_state == "SEARCHING":
                 status = "LASER LOST -- RECOVERING TOWARD FRAME CENTER"
                 status_color = (0, 0, 255)
             elif laser_x is None:
@@ -1623,50 +1617,52 @@ def main():
                 output, status, (30, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2
             )
-
             if sequence_running:
                 cv2.putText(
                     output, f"SEQUENCE RUNNING ({len(pending_targets)} remaining)",
-                    (30, 255),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2
+                    (30, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2
                 )
-
             cv2.putText(
-                output, f"Pulse: {pulse_us:.1f} us", (30, 80),
+                output, f"Servo pos: {servo_position:.0f}", (30, 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
             )
-
             cv2.putText(
                 output, f"Blob area: {blob_area:.1f}", (30, 115),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
             )
-
             cv2.putText(
-                output, f"Contours: {num_contours}",
-                (30, 150),
+                output, f"Contours: {num_contours}", (30, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
             )
-
             if error_x is not None:
                 cv2.putText(
                     output, f"{CONTROL_AXIS.upper()} Error: {error_x:+.1f} px", (30, 185),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
                 )
-
             cv2.putText(
                 output, f"Axis: {CONTROL_AXIS.upper()}  (press A to switch)", (30, 290),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2
             )
 
+            if world_lock_active:
+                pose_str = (
+                    f"pose=({vehicle_pose[0]:.2f},{vehicle_pose[1]:.2f},"
+                    f"{math.degrees(vehicle_pose[2]):.0f}deg)"
+                    if vehicle_pose is not None else "pose=UNAVAILABLE"
+                )
+                cv2.putText(
+                    output,
+                    f"World-lock ({world_lock_x:.2f}, {world_lock_y:.2f})  {pose_str}",
+                    (30, 355), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2
+                )
+
             if target_x is not None:
                 actuator_axis_label = "y" if CONTROL_AXIS == "x" else "x"
                 act_status = (
                     f"Actuator ({actuator_axis_label.upper()}): {actuator_state}"
-                    + (
-                        f"  err={actuator_error:+.1f}px"
-                        if actuator_error is not None else ""
-                    )
-                    + f"  pos={actuator_position}"
+                    + (f"  err={actuator_error:+.1f}px" if actuator_error is not None else "")
+                    + f"  pos={actuator_get_position()}"
+                    + f"  spd={actuator_get_speed():.0f}"
                 )
                 cv2.putText(
                     output, act_status, (30, 320),
@@ -1675,18 +1671,19 @@ def main():
 
             fps_count += 1
             now = time.monotonic()
-
             if now - fps_start >= 1.0:
                 fps = fps_count / (now - fps_start)
                 fps_count = 0
                 fps_start = now
-
             cv2.putText(
                 output, f"FPS: {fps:.1f}", (30, 220),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
             )
 
-            draw_params_overlay(output, tunable_params)
+            draw_params_overlay(output, get_tunable_params())
+            # Recomputed live every frame rather than reusing the
+            # `tunable_params` startup snapshot -- calibration marked
+            # mid-run (1/2/3/4) previously never showed up here.
 
             cv2.imshow(WINDOW_NAME, output)
             cv2.imshow(RAW_WINDOW, frame)
@@ -1695,18 +1692,10 @@ def main():
                 combined = np.hstack((output, frame))
                 video_writer.write(combined)
 
-            # ------------------------------------------------
-            # Logging (original -- untouched)
-            # ------------------------------------------------
-
             log_data(
                 frame_number, target_x, target_y, laser_x, laser_y,
-                error_x, pulse_us, blob_area, num_contours, tracking
+                error_x, servo_position, blob_area, num_contours, tracking
             )
-
-            # ------------------------------------------------
-            # Logging (extra diagnostic log)
-            # ------------------------------------------------
 
             log_extra_data({
                 "frame": frame_number,
@@ -1719,18 +1708,19 @@ def main():
                 "laser_y": laser_y,
                 "filtered_x": filtered_x,
                 "error_x": error_x,
-                "correction_us": correction,
-                "pulse_us": pulse_us,
-                "jitter_offset_us": jitter_offset,
+                "servo_position": servo_position,
                 "actuator_axis": "y" if CONTROL_AXIS == "x" else "x",
                 "actuator_state": actuator_state,
                 "actuator_error": actuator_error,
-                "actuator_position": actuator_position,
+                "actuator_position": actuator_get_position(),
+                "actuator_speed": actuator_get_speed(),
+                "world_lock_active": world_lock_active,
+                "world_lock_x": world_lock_x,
+                "world_lock_y": world_lock_y,
+                "vehicle_pose_x": vehicle_pose[0] if vehicle_pose else None,
+                "vehicle_pose_y": vehicle_pose[1] if vehicle_pose else None,
+                "vehicle_pose_yaw": vehicle_pose[2] if vehicle_pose else None,
             })
-
-            # ------------------------------------------------
-            # Keyboard
-            # ------------------------------------------------
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -1738,55 +1728,83 @@ def main():
                 break
 
             elif key == ord("g"):
-
                 if not sequence_running and pending_targets:
-
                     sequence_running = True
                     target_x, target_y = pending_targets.pop(0)
                     target_state = "IDLE"
                     filtered_x = None
                     settle_dwell_start = None
-
                     print()
                     print(
-                        f"[SEQUENCE] Starting -- "
-                        f"x={target_x}, y={target_y} "
+                        f"[SEQUENCE] Starting -- x={target_x}, y={target_y} "
                         f"({len(pending_targets)} remaining)"
                     )
-
                 elif sequence_running:
-
                     print()
                     print("[SEQUENCE] Already running")
-
                 else:
-
                     print()
                     print("[SEQUENCE] No queued targets -- click to add some first")
 
+            elif key == ord("l"):
+                if world_lock_active:
+                    print()
+                    print("[WORLD-LOCK] Already locked -- press C to release first")
+                elif target_state != "SETTLED":
+                    print()
+                    print("[WORLD-LOCK] Target must be SETTLED before locking")
+                else:
+                    pose = get_vehicle_pose()
+                    if pose is None:
+                        print()
+                        print(
+                            f"[WORLD-LOCK] No vehicle pose available -- "
+                            f"check {VEHICLE_POSE_FILE}"
+                        )
+                    else:
+                        point = compute_world_lock_point(
+                            pose, servo_position, actuator_get_position()
+                        )
+                        if point is None:
+                            print()
+                            print(
+                                "[WORLD-LOCK] Current aim doesn't intersect "
+                                "the ground -- can't lock"
+                            )
+                        else:
+                            world_lock_x, world_lock_y = point
+                            world_lock_active = True
+                            target_x = None
+                            target_y = None
+                            target_state = "IDLE"
+                            print()
+                            print(
+                                f"[WORLD-LOCK] Locked at world "
+                                f"({world_lock_x:.2f}, {world_lock_y:.2f})"
+                            )
+
             elif key == ord("a"):
-
                 CONTROL_AXIS = "y" if CONTROL_AXIS == "x" else "x"
-
-                # Reset in-flight control state only -- target_x/
-                # target_y, pending_targets, and sequence_running are
-                # left alone, since every queued point already has
-                # both coordinates and stays valid under either axis.
                 filtered_x = None
                 error_x = None
                 settle_dwell_start = None
-
                 if target_x is not None:
                     target_state = "IDLE"
                     settled_since = None
-
                 print()
                 print(f"[AXIS] Switched control axis to {CONTROL_AXIS.upper()}")
 
             elif key == ord("r"):
-
-                pulse_us = float(NEUTRAL_PULSE_US)
-                set_pulse_us(pulse_us)
+                servo_position = set_servo_position(
+                    float(ST_MIDDLE_POSITION), speed=SERVO_SPEED_NEAR
+                )
+                # Captures the clamped return value -- previously this
+                # discarded it and left `servo_position` holding the
+                # unclamped ST_MIDDLE_POSITION even when the hardware
+                # was actually sent somewhere else (if 2047 falls
+                # outside your calibrated range), re-introducing the
+                # same software/hardware desync fixed at startup.
+                actuator_set_target_speed(0.0)
 
                 target_x = None
                 target_y = None
@@ -1797,12 +1815,18 @@ def main():
                 pending_targets = []
                 sequence_running = False
                 settled_since = None
+                world_lock_active = False
+                world_lock_x = None
+                world_lock_y = None
+                jog_mode = False
+                sweep_active = False
+                sweep_leg = None
+                actuator_jog_until = 0.0
 
                 print()
-                print("[SERVO] Returned to 1500 us")
+                print("[SERVO] Returned to middle position")
 
             elif key == ord("c"):
-
                 target_x = None
                 target_y = None
                 target_state = "IDLE"
@@ -1812,57 +1836,140 @@ def main():
                 pending_targets = []
                 sequence_running = False
                 settled_since = None
+                actuator_set_target_speed(0.0)
+                world_lock_active = False
+                world_lock_x = None
+                world_lock_y = None
+                sweep_active = False
+                sweep_leg = None
+                actuator_jog_until = 0.0
 
                 print()
                 print("[TARGET] Cancelled")
 
+            elif key == ord("m"):
+                if target_x is None and not sweep_active:
+                    jog_mode = not jog_mode
+                    actuator_set_target_speed(0.0)
+                    actuator_jog_until = 0.0
+                    print()
+                    print(f"[JOG] {'Entered' if jog_mode else 'Exited'} jog mode")
+                else:
+                    print()
+                    print("[JOG] Cancel the active target/sweep first (C)")
+
+            elif key == ord("i") and jog_mode:
+                servo_position = set_servo_position(
+                    servo_position - JOG_STEP_SERVO, speed=JOG_SPEED_SERVO
+                )
+                print(f"[JOG] Servo -> {servo_position}")
+
+            elif key == ord("k") and jog_mode:
+                servo_position = set_servo_position(
+                    servo_position + JOG_STEP_SERVO, speed=JOG_SPEED_SERVO
+                )
+                print(f"[JOG] Servo -> {servo_position}")
+
+            elif key == ord("u") and jog_mode:
+                actuator_set_target_speed(-JOG_SPEED_ACTUATOR)
+                actuator_jog_until = time.monotonic() + ACTUATOR_JOG_PULSE_S
+                print(f"[JOG] Actuator -> {actuator_get_position()}")
+
+            elif key == ord("o") and jog_mode:
+                actuator_set_target_speed(JOG_SPEED_ACTUATOR)
+                actuator_jog_until = time.monotonic() + ACTUATOR_JOG_PULSE_S
+                print(f"[JOG] Actuator -> {actuator_get_position()}")
+
+            elif key == ord("1") and jog_mode:
+                ST_VISIBLE_MIN_POSITION = int(servo_position)
+                save_calibration()
+                print(f"[CALIBRATION] Servo MIN marked at {ST_VISIBLE_MIN_POSITION}")
+
+            elif key == ord("2") and jog_mode:
+                ST_VISIBLE_MAX_POSITION = int(servo_position)
+                save_calibration()
+                print(f"[CALIBRATION] Servo MAX marked at {ST_VISIBLE_MAX_POSITION}")
+
+            elif key == ord("3") and jog_mode:
+                ACTUATOR_MIN_POSITION = actuator_get_position()
+                save_calibration()
+                print(f"[CALIBRATION] Actuator MIN marked at {ACTUATOR_MIN_POSITION}")
+
+            elif key == ord("4") and jog_mode:
+                ACTUATOR_MAX_POSITION = actuator_get_position()
+                save_calibration()
+                print(f"[CALIBRATION] Actuator MAX marked at {ACTUATOR_MAX_POSITION}")
+
+            elif key == ord("t"):
+                if sweep_active:
+                    sweep_active = False
+                    sweep_leg = None
+                    actuator_set_target_speed(0.0)
+                    print()
+                    print("[SWEEP] Aborted")
+                elif target_x is not None:
+                    print()
+                    print("[SWEEP] Cancel the active target first (C)")
+                else:
+                    jog_mode = False
+                    sweep_active = True
+                    sweep_leg = "to_min"
+                    print()
+                    print("[SWEEP] Starting -- servo+actuator MIN -> MAX -> stop")
+
+            elif key == ord("j"):
+                if target_state == "JITTERING":
+                    print()
+                    print("[JITTER] Already jittering")
+                elif laser_x is None:
+                    print()
+                    print("[JITTER] Laser not currently detected -- can't seed a position")
+                else:
+                    if target_x is None:
+                        target_x = int(laser_x)
+                        target_y = int(laser_y) if laser_y is not None else 0
+                        target_state = "IDLE"
+                    target_state = "JITTERING"
+                    jitter_start_time = time.monotonic()
+                    jitter_base_position = servo_position
+                    print()
+                    print("[JITTER] Manually triggered at current position")
+
     finally:
 
         print()
-        print("Returning servo to neutral...")
+        print("Returning servo to middle position...")
 
         try:
-            set_pulse_us(NEUTRAL_PULSE_US)
+            set_servo_position(ST_MIDDLE_POSITION)
             time.sleep(0.5)
         except Exception as e:
-            print(f"Could not return to neutral: {e}")
+            print(f"Could not return to middle: {e}")
 
-        # Deliberately NOT calling stop_pwm() here. Disabling the PWM
-        # channel cuts the signal entirely, and most servos only hold
-        # a position while they're actively receiving pulses -- once
-        # the signal stops, they go limp and can drift away from
-        # neutral under their own mechanical load (gravity, cable
-        # drag, an off-balance mount, etc). Leaving the channel
-        # enabled at NEUTRAL_PULSE_US keeps it actively parked there
-        # after the script exits. Call stop_pwm() manually if you
-        # ever want to fully power down the channel instead.
-        # (A stop_pwm() call had crept back in here -- that's exactly
-        # what caused the "not returning to neutral" bug the first
-        # time around, so it's been removed again.)
+        # Servo: left with torque on at its last commanded position --
+        # the ST3215 holds position with force by default (that's
+        # what the "Torque" state means for this servo), no special
+        # action needed to keep it from drifting the way the old PWM
+        # servo could.
 
-        # Actuator: disabling it here is the OPPOSITE choice from the
-        # servo above, on purpose. fuyu_actuator.py itself disables
-        # the motor on every exit path, including a clean quit -- and
-        # with no limit switches or calibration configured on this
-        # axis, holding current indefinitely on an unsupervised,
-        # unhomed stepper is a real thermal/mechanical risk that
-        # doesn't have a good equivalent on the hobby servo side. The
-        # tradeoff: this axis can drift once disabled, same failure
-        # mode as the servo bug, just accepted deliberately here. If
-        # you'd rather it hold position like the servo does, remove
-        # the act_disable() call below -- but note GPIO.cleanup()
-        # resets pin state on exit regardless, so holding position
-        # reliably after the script exits may need more than that;
-        # test it before relying on it.
+        # Actuator: ramp down cleanly, then disable -- same reasoning
+        # as before (no limit switches/calibration on this axis, so
+        # holding current indefinitely on an unsupervised stepper is
+        # the greater risk).
+        actuator_set_target_speed(0.0)
+        time.sleep(0.5)
+        _actuator_running = False
+        actuator_thread.join(timeout=1.0)
         act_disable()
         GPIO.cleanup()
+
+        close_st_servo()
 
         cap.release()
         cv2.destroyAllWindows()
 
         if log_file is not None:
             log_file.close()
-
         if extra_log_file is not None:
             extra_log_file.close()
 

@@ -5,7 +5,7 @@ from ultralytics import YOLO
 # -----------------------------
 # YOLO model
 # -----------------------------
-model = YOLO("horseradish_best_8n.pt")
+model = YOLO("best.pt")
 # model = YOLO("yolo26m.engine")
 
 # -----------------------------
