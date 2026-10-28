@@ -51,9 +51,9 @@ ST_ACCEL = 200
 # LASER DETECTION
 # ============================================================
 
-BRIGHTNESS_MIN = 240
+BRIGHTNESS_MIN = 245
 BRIGHTNESS_MAX = 255
-MORPH_KERNEL_SIZE = 5
+MORPH_KERNEL_SIZE = 10
 MIN_BLOB_AREA = 6
 
 

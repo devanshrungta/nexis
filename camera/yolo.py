@@ -5,8 +5,8 @@ from ultralytics import YOLO
 # -----------------------------
 # YOLO model
 # -----------------------------
-model = YOLO("best.pt")
-# model = YOLO("yolo26m.engine")
+# model = YOLO("best.pt")
+model = YOLO("yolo26n-cls.pt")
 
 # -----------------------------
 # Camera
@@ -49,6 +49,7 @@ while True:
         frame,
         imgsz=640,
         conf=0.5,
+        quantize="fp16",
         verbose=False
     )
 
