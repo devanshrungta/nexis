@@ -1,7 +1,7 @@
 {
-  "servo_min": 1981,
-  "servo_max": 2541,
+  "servo_min": 1930,
+  "servo_max": 2171,
   "actuator_min": 0,
-  "actuator_max": 12596,
-  "actuator_travel": 12596
+  "actuator_max": 12954,
+  "actuator_travel": 12954
 }

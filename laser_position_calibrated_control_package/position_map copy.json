@@ -1,0 +1,179 @@
+{
+  "version": 2,
+  "map_type": "SCATTERED",
+  "camera_width": 1280,
+  "camera_height": 720,
+  "samples": [
+    {
+      "id": 1,
+      "placement": 1,
+      "corner": "1",
+      "x": 571.0,
+      "y": 441.0,
+      "servo": 2103.0,
+      "actuator": 7065.0
+    },
+    {
+      "id": 2,
+      "placement": 1,
+      "corner": "6",
+      "x": 995.0,
+      "y": 437.0,
+      "servo": 2089.0,
+      "actuator": 13299.0
+    },
+    {
+      "id": 3,
+      "placement": 1,
+      "corner": "30",
+      "x": 966.0,
+      "y": 686.0,
+      "servo": 1799.0,
+      "actuator": 13299.0
+    },
+    {
+      "id": 4,
+      "placement": 2,
+      "corner": "1",
+      "x": 206.0,
+      "y": 434.0,
+      "servo": 2146.0,
+      "actuator": 460.0
+    },
+    {
+      "id": 5,
+      "placement": 2,
+      "corner": "6",
+      "x": 635.0,
+      "y": 413.0,
+      "servo": 2141.0,
+      "actuator": 6811.0
+    },
+    {
+      "id": 6,
+      "placement": 2,
+      "corner": "30",
+      "x": 652.0,
+      "y": 678.0,
+      "servo": 1843.0,
+      "actuator": 6955.0
+    },
+    {
+      "id": 7,
+      "placement": 2,
+      "corner": "25",
+      "x": 256.0,
+      "y": 686.0,
+      "servo": 1833.0,
+      "actuator": 639.0
+    },
+    {
+      "id": 8,
+      "placement": 3,
+      "corner": "1",
+      "x": 637.0,
+      "y": 22.0,
+      "servo": 2464.0,
+      "actuator": 6945.0
+    },
+    {
+      "id": 9,
+      "placement": 3,
+      "corner": "6",
+      "x": 1073.0,
+      "y": 43.0,
+      "servo": 2464.0,
+      "actuator": 13266.0
+    },
+    {
+      "id": 10,
+      "placement": 3,
+      "corner": "30",
+      "x": 1070.0,
+      "y": 332.0,
+      "servo": 2208.0,
+      "actuator": 13239.0
+    },
+    {
+      "id": 11,
+      "placement": 3,
+      "corner": "25",
+      "x": 643.0,
+      "y": 338.0,
+      "servo": 2230.0,
+      "actuator": 6900.0
+    },
+    {
+      "id": 12,
+      "placement": 4,
+      "corner": "1",
+      "x": 243.0,
+      "y": 100.0,
+      "servo": 2424.0,
+      "actuator": 1422.0
+    },
+    {
+      "id": 13,
+      "placement": 4,
+      "corner": "6",
+      "x": 704.0,
+      "y": 73.0,
+      "servo": 2428.0,
+      "actuator": 7770.0
+    },
+    {
+      "id": 14,
+      "placement": 4,
+      "corner": "30",
+      "x": 708.0,
+      "y": 391.0,
+      "servo": 2182.0,
+      "actuator": 7738.0
+    },
+    {
+      "id": 15,
+      "placement": 4,
+      "corner": "25",
+      "x": 261.0,
+      "y": 401.0,
+      "servo": 2164.0,
+      "actuator": 1386.0
+    },
+    {
+      "id": 16,
+      "placement": 5,
+      "corner": "1",
+      "x": 479.0,
+      "y": 210.0,
+      "servo": 2346.0,
+      "actuator": 4736.0
+    },
+    {
+      "id": 17,
+      "placement": 5,
+      "corner": "6",
+      "x": 943.0,
+      "y": 190.0,
+      "servo": 2362.0,
+      "actuator": 11071.0
+    },
+    {
+      "id": 18,
+      "placement": 5,
+      "corner": "30",
+      "x": 940.0,
+      "y": 482.0,
+      "servo": 2068.0,
+      "actuator": 11161.0
+    },
+    {
+      "id": 19,
+      "placement": 5,
+      "corner": "25",
+      "x": 504.0,
+      "y": 511.0,
+      "servo": 2061.0,
+      "actuator": 4838.0
+    }
+  ]
+}

@@ -33,9 +33,9 @@ ST_BAUDRATE = 115200
 ST_SERVO_ID = 1
 
 # Absolute electrical range of the servo.
-ST_MIN_POSITION = 1981
-ST_MAX_POSITION = 2541
-ST_MIDDLE_POSITION = 2150
+ST_MIN_POSITION = 1740
+ST_MAX_POSITION = 2440
+ST_MIDDLE_POSITION = 2048
 # Fallback middle before calibration is loaded. After calibration, the
 # actual safe middle is computed from ST_VISIBLE_MIN/MAX_POSITION.
 
@@ -48,6 +48,8 @@ ST_SPEED_NEAR = 100
 ST_SPEED_EASE_PX = 60
 ST_ACCEL = 200
 
+JOG_STEP_SERVO = 20
+JOG_SPEED_SERVO = 200
 
 # ============================================================
 # SIMPLE 2-DOF CONTROLLER
@@ -73,7 +75,10 @@ ALPHA = 0.4
 
 SERVO_SETTLE_DEADBAND_PX = 20
 ACTUATOR_SETTLE_DEADBAND_PX = 7
-SETTLE_DWELL_S = 1
+# Require a short stable dwell before declaring the target reached and
+# starting automatic servo jitter. Tiny target-map fluctuations are filtered
+# by the command deadbands below, so they should not keep restarting this timer.
+SETTLE_DWELL_S = 0.35
 
 MAX_SERVO_STEP_PER_UPDATE = 30
 MAX_ACTUATOR_STEP_PER_UPDATE = 15000
@@ -145,7 +150,7 @@ VISION_MAX_LOST_FRAMES = 8
 AUTO_JITTER = True
 JITTER_DURATION_S = 3.0
 JITTER_AMPLITUDE_POS = 20
-JITTER_FREQUENCY_HZ = 5.0
+JITTER_FREQUENCY_HZ = 6.0
 # Mechanical command-reversal frequency in Hz. One full +A -> -A -> +A
 # cycle takes 1 / JITTER_FREQUENCY_HZ seconds.
 #
@@ -169,14 +174,16 @@ ACT_STEP_PIN = 29
 ACT_DIR_PIN = 31
 ACT_EN_PIN = 33
 
-ACT_MAX_SPEED_STEPS_S = 15000
-ACT_ACCELERATION_STEPS_S2 = 5000
+ACT_MAX_SPEED_STEPS_S = 8000
+ACT_ACCELERATION_STEPS_S2 = 1000
 
-ACT_JOG_SPEED_STEPS_S = 1400
-ACTUATOR_JOG_PULSE_S = 0.15
+ACT_JOG_SPEED_STEPS_S = 1400  # Retained for reference; U/O now use position targets.
+ACTUATOR_JOG_PULSE_S = 0.15  # Retained for reference; fixed-step jog no longer uses timed pulses.
+ACT_JOG_STEP_STEPS = 100
+ACT_JOG_KEY_DEBOUNCE_S = 0.18
 
-ACT_UNREFERENCED_JOG_LIMIT = 20000
-ACTUATOR_CALIBRATION_EXTENSION_LIMIT = 30000
+ACT_UNREFERENCED_JOG_LIMIT = 50000
+ACTUATOR_CALIBRATION_EXTENSION_LIMIT = 50000
 
 ACT_ENDPOINT_TOLERANCE_STEPS = 5
 ACT_STOP_SPEED_THRESHOLD = 10
@@ -184,10 +191,10 @@ ACT_STOP_SPEED_THRESHOLD = 10
 CALIBRATION_FILE = "servo_calibration.json"
 POSITION_MAP_FILE = "position_map.json"
 
-# Runtime uses absolute calibrated positions. These thresholds only avoid
-# redundant commands when the tracked target moves by a negligible amount.
-POSITION_SERVO_COMMAND_MIN_DELTA = 1.0
-POSITION_ACTUATOR_COMMAND_MIN_DELTA = 1.0
+# Runtime uses absolute calibrated positions. Ignore very small map/vision
+# fluctuations so the motors do not receive repeated tiny retargets near rest.
+POSITION_SERVO_COMMAND_MIN_DELTA = 2.0
+POSITION_ACTUATOR_COMMAND_MIN_DELTA = 10.0
 POSITION_SERVO_STATUS_CHECK_INTERVAL = 0.05
 
 
@@ -453,11 +460,22 @@ def set_actuator_direction(direction):
 
 
 def precise_wait(seconds):
-    seconds = max(0.000002, seconds)
-    guard = min(0.00004, seconds)
-    if seconds > guard:
-        time.sleep(seconds - guard)
-    deadline = time.perf_counter() + guard
+    """Wait against an absolute deadline to reduce STEP-pulse timing jitter.
+
+    time.sleep() is too coarse for the ~50 us half-period used at 10,000
+    steps/s, so short waits busy-spin instead of sleeping for a few us and
+    potentially overshooting by much more. Longer waits sleep until the last
+    100 us, then spin to the deadline. This improves timing consistency but
+    cannot make Linux/Python GPIO a hard-real-time pulse generator.
+    """
+    seconds = max(0.000002, float(seconds))
+    deadline = time.perf_counter() + seconds
+
+    if seconds > 0.001:
+        sleep_time = deadline - time.perf_counter() - 0.0001
+        if sleep_time > 0.0:
+            time.sleep(sleep_time)
+
     while time.perf_counter() < deadline:
         pass
 
@@ -513,6 +531,83 @@ def wait_for_actuator_stop(timeout):
             return True
         time.sleep(0.005)
     return abs(get_actuator_speed()) <= ACT_STOP_SPEED_THRESHOLD
+
+
+def set_actuator_jog_target(position):
+    """Set a fixed-step jog target with bounds appropriate to the current mode."""
+    global _actuator_target_speed, _actuator_position_target, _actuator_position_mode
+
+    with _actuator_lock:
+        referenced = _actuator_referenced and ACTUATOR_MAX_POSITION > 0
+        extension = _actuator_extension_mode
+        if referenced:
+            low, high = ACTUATOR_MIN_POSITION, ACTUATOR_MAX_POSITION
+        elif extension:
+            low, high = -ACTUATOR_CALIBRATION_EXTENSION_LIMIT, ACTUATOR_CALIBRATION_EXTENSION_LIMIT
+        else:
+            # This is only a software-count limit, not a physical end-stop.
+            low, high = -ACT_UNREFERENCED_JOG_LIMIT, ACT_UNREFERENCED_JOG_LIMIT
+
+        position = float(clamp(position, low, high))
+        _actuator_position_target = position
+        _actuator_position_mode = True
+        _actuator_target_speed = 0.0
+
+    return position
+
+
+def command_actuator_jog_step(direction):
+    """Advance the outstanding jog target by one fixed number of steps."""
+    with _actuator_lock:
+        if _actuator_position_mode and _actuator_position_target is not None:
+            base_position = float(_actuator_position_target)
+        else:
+            base_position = float(_actuator_position)
+
+    requested = base_position + int(direction) * ACT_JOG_STEP_STEPS
+    target = set_actuator_jog_target(requested)
+    if abs(target - base_position) < 0.5:
+        print("[JOG] Software travel limit reached; no jog command issued")
+    return target
+
+
+def move_actuator_to_position_and_wait(target, timeout=15.0, label="move"):
+    """Move once to an absolute target; avoid repeatedly reversing velocity near it."""
+    if not actuator_is_referenced():
+        set_actuator_speed(0.0)
+        print(f"[ACTUATOR] {label}: cannot move to saved position because actuator is unreferenced")
+        return False
+
+    target = float(clamp(target, ACTUATOR_MIN_POSITION, ACTUATOR_MAX_POSITION))
+
+    # Cancel any jog/sweep velocity request and let the actuator stop before
+    # issuing one absolute position target.
+    set_actuator_speed(0.0)
+    if not wait_for_actuator_stop(4.0):
+        print(f"[ACTUATOR] {label}: warning -- actuator did not stop promptly before repositioning")
+
+    set_actuator_position_target(target)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = get_actuator_position()
+        speed = get_actuator_speed()
+        if (
+            abs(target - current) <= ACT_ENDPOINT_TOLERANCE_STEPS
+            and abs(speed) <= ACT_STOP_SPEED_THRESHOLD
+        ):
+            set_actuator_speed(0.0)
+            wait_for_actuator_stop(1.0)
+            print(f"[ACTUATOR] {label}: reached target {target:.0f} (position count={get_actuator_position()})")
+            return True
+        time.sleep(0.01)
+
+    set_actuator_speed(0.0)
+    wait_for_actuator_stop(4.0)
+    print(
+        f"[ACTUATOR] WARNING: {label} timed out; target={target:.0f}, "
+        f"position count={get_actuator_position()}, speed={get_actuator_speed():.1f}"
+    )
+    return False
 
 
 def actuator_thread():
@@ -603,6 +698,26 @@ def actuator_thread():
                 )
                 if abs(current_speed) > endpoint_speed:
                     current_speed = math.copysign(endpoint_speed, current_speed)
+        elif not referenced:
+            # A conservative software-count boundary for unreferenced motion.
+            # It cannot protect against a physical end-stop if the initial count is unknown.
+            unreferenced_limit = (
+                ACTUATOR_CALIBRATION_EXTENSION_LIMIT
+                if extension_mode
+                else ACT_UNREFERENCED_JOG_LIMIT
+            )
+            if current_speed > 0 and position >= unreferenced_limit:
+                current_speed = 0.0
+                with _actuator_lock:
+                    _actuator_target_speed = 0.0
+                    _actuator_position_target = None
+                    _actuator_position_mode = False
+            elif current_speed < 0 and position <= -unreferenced_limit:
+                current_speed = 0.0
+                with _actuator_lock:
+                    _actuator_target_speed = 0.0
+                    _actuator_position_target = None
+                    _actuator_position_mode = False
 
         with _actuator_lock:
             _actuator_speed = current_speed
@@ -1240,10 +1355,41 @@ def main():
             f"current camera is {FRAME_WIDTH}x{FRAME_HEIGHT}"
         )
 
-    print(
-        f"[MAP] Loaded {POSITION_MAP_FILE}: "
-        f"{position_map.rows}x{position_map.cols} grid"
-    )
+    if position_map.map_type == "SCATTERED":
+        print(
+            f"[MAP] Loaded {POSITION_MAP_FILE}: "
+            f"{position_map.sample_count} multi-placement samples"
+        )
+        print(
+            "[MAP] Inside the measured sample hull: scattered-triangle interpolation; "
+            "outside: global quadratic pixel-to-position extrapolation"
+        )
+        print(
+            f"[MAP] Global quadratic fit RMSE (training points): "
+            f"servo={position_map.model_rmse_servo:.1f} positions, "
+            f"actuator={position_map.model_rmse_actuator:.1f} steps"
+        )
+    else:
+        print(
+            f"[MAP] Loaded {POSITION_MAP_FILE}: "
+            f"{position_map.rows}x{position_map.cols} grid"
+        )
+        print(
+            "[MAP] Outside the A4 grid: using planar projective mapping + "
+            "global quadratic actuator-position model"
+        )
+        print(
+            f"[MAP] Global model fit RMSE (training points): "
+            f"servo={position_map.model_rmse_servo:.1f} positions, "
+            f"actuator={position_map.model_rmse_actuator:.1f} steps; "
+            f"grid homography reprojection RMSE={position_map.homography_rmse_px:.1f}px"
+        )
+        if position_map.homography_rmse_px > 5.0:
+            print(
+                "[MAP] WARNING: grid homography residual is high. Check the 30 "
+                "clicked points, lens distortion, and that the calibration sheet "
+                "was flat in the target plane."
+            )
 
     # Use the midpoint of the saved safe/visible range. This avoids an
     # inconsistent situation such as saved 1981..2052 with a fixed middle
@@ -1311,7 +1457,8 @@ def main():
     servo_is_moving = False
 
     jog_mode = False
-    actuator_jog_until = 0.0
+    actuator_jog_until = 0.0  # No longer used for U/O; retained for compatibility with the loop state.
+    last_actuator_jog_key_time = -1e9
 
     sweep_active = False
     sweep_selection_pending = False
@@ -1451,6 +1598,10 @@ def main():
                             position_map.pixel_to_position(target_x, target_y)
                         )
 
+                        # Keep the unbounded model output only long enough to report
+                        # when the safe mechanical limits clip a requested target.
+                        raw_servo_target = mapped_servo_target
+                        raw_actuator_target = mapped_actuator_target
                         mapped_servo_target = clamp(
                             mapped_servo_target,
                             ST_VISIBLE_MIN_POSITION,
@@ -1461,6 +1612,11 @@ def main():
                             ACTUATOR_MIN_POSITION,
                             ACTUATOR_MAX_POSITION,
                         )
+                        if (
+                            abs(raw_servo_target - mapped_servo_target) > 0.5
+                            or abs(raw_actuator_target - mapped_actuator_target) > 0.5
+                        ):
+                            map_status = f"{map_status}-LIMIT"
 
                         # Absolute servo target. No ReadPosition() on every
                         # frame - the servo controller already receives the
@@ -1581,10 +1737,7 @@ def main():
             if not target_active and not sweep_active and not jog_mode:
                 set_actuator_speed(0.0)
 
-            # Manual actuator jog timeout.
-            if jog_mode and actuator_jog_until and now >= actuator_jog_until:
-                set_actuator_speed(0.0)
-                actuator_jog_until = 0.0
+            # U/O jogs are finite position targets, so they do not need a time-based stop.
 
             # ---------------- SWEEP ----------------
             if sweep_active:
@@ -1732,9 +1885,16 @@ def main():
                 )
 
             if target_active and tracked_target is not None:
+                if mapped_servo_target is not None and mapped_actuator_target is not None:
+                    map_text = (
+                        f"Map {map_status}  servo={mapped_servo_target:.0f}  "
+                        f"act={mapped_actuator_target:.0f}"
+                    )
+                else:
+                    map_text = "Map waiting..."
                 cv2.putText(
                     output,
-                    f"Map {map_status}  servo={mapped_servo_target:.0f}  act={mapped_actuator_target:.0f}",
+                    map_text,
                     (25, 310),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -1837,22 +1997,13 @@ def main():
                     acc=ST_ACCEL,
                 )
                 if actuator_is_referenced():
-                    middle = actuator_middle()
-                    deadline = time.monotonic() + 5.0
-                    while time.monotonic() < deadline:
-                        current = get_actuator_position()
-                        remaining = middle - current
-                        if abs(remaining) <= ACT_ENDPOINT_TOLERANCE_STEPS:
-                            set_actuator_speed(0.0)
-                            break
-                        speed = min(
-                            ACT_MAX_SPEED_STEPS_S,
-                            math.sqrt(2.0 * ACT_ACCELERATION_STEPS_S2 * abs(remaining)),
-                        )
-                        set_actuator_speed(math.copysign(speed, remaining))
-                        time.sleep(0.01)
-                    wait_for_actuator_stop(1.0)
-                print("[SYSTEM] Return to MIDDLE commanded")
+                    move_actuator_to_position_and_wait(
+                        actuator_middle(), timeout=15.0, label="R return to middle"
+                    )
+                else:
+                    wait_for_actuator_stop(4.0)
+                    print("[ACTUATOR] Not referenced; stopped without attempting a midpoint move")
+                print("[SYSTEM] Return to MIDDLE completed or safely stopped")
                 continue
 
             if key == ord("c"):
@@ -1908,39 +2059,19 @@ def main():
                 continue
 
             if key == ord("u") and jog_mode:
-                with _actuator_lock:
-                    position = _actuator_position
-                    extension = _actuator_extension_mode
-                    referenced = _actuator_referenced
-                if extension:
-                    allowed = position > -ACTUATOR_CALIBRATION_EXTENSION_LIMIT
-                elif referenced:
-                    allowed = position > ACTUATOR_MIN_POSITION
-                else:
-                    allowed = position > -ACT_UNREFERENCED_JOG_LIMIT
-                if allowed:
-                    set_actuator_speed(-ACT_JOG_SPEED_STEPS_S)
-                    actuator_jog_until = now + ACTUATOR_JOG_PULSE_S
-                else:
-                    set_actuator_speed(0.0)
+                if now - last_actuator_jog_key_time < ACT_JOG_KEY_DEBOUNCE_S:
+                    continue
+                last_actuator_jog_key_time = now
+                target = command_actuator_jog_step(-1)
+                print(f"[JOG] Actuator target -> {target:.0f} ({-ACT_JOG_STEP_STEPS:+d} steps requested)")
                 continue
 
             if key == ord("o") and jog_mode:
-                with _actuator_lock:
-                    position = _actuator_position
-                    extension = _actuator_extension_mode
-                    referenced = _actuator_referenced
-                if extension:
-                    allowed = position < ACTUATOR_CALIBRATION_EXTENSION_LIMIT
-                elif referenced:
-                    allowed = position < ACTUATOR_MAX_POSITION
-                else:
-                    allowed = position < ACT_UNREFERENCED_JOG_LIMIT
-                if allowed:
-                    set_actuator_speed(ACT_JOG_SPEED_STEPS_S)
-                    actuator_jog_until = now + ACTUATOR_JOG_PULSE_S
-                else:
-                    set_actuator_speed(0.0)
+                if now - last_actuator_jog_key_time < ACT_JOG_KEY_DEBOUNCE_S:
+                    continue
+                last_actuator_jog_key_time = now
+                target = command_actuator_jog_step(+1)
+                print(f"[JOG] Actuator target -> {target:.0f} ({ACT_JOG_STEP_STEPS:+d} steps requested)")
                 continue
 
             if key == ord("e") and jog_mode:
@@ -2015,23 +2146,13 @@ def main():
         set_actuator_speed(0.0)
 
         if actuator_is_referenced():
-            middle = actuator_middle()
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                current = get_actuator_position()
-                remaining = middle - current
-                if abs(remaining) <= ACT_ENDPOINT_TOLERANCE_STEPS:
-                    set_actuator_speed(0.0)
-                    break
-                speed = min(
-                    ACT_MAX_SPEED_STEPS_S,
-                    math.sqrt(2.0 * ACT_ACCELERATION_STEPS_S2 * abs(remaining)),
-                )
-                set_actuator_speed(math.copysign(speed, remaining))
-                time.sleep(0.01)
-            wait_for_actuator_stop(1.0)
+            move_actuator_to_position_and_wait(
+                actuator_middle(), timeout=15.0, label="shutdown return to middle"
+            )
         else:
             set_actuator_speed(0.0)
+            wait_for_actuator_stop(4.0)
+            print("[ACTUATOR] Shutdown: actuator unreferenced; stopped without a midpoint move")
 
         try:
             set_servo_position(servo_middle_position(), speed=ST_SPEED_NEAR, acc=ST_ACCEL)
