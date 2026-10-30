@@ -1,13 +1,13 @@
 {
   "camera_device": 0,
-  "green_h_min": 27,
-  "green_h_max": 74,
-  "green_s_min": 39,
-  "green_s_max": 254,
-  "green_v_min": 88,
+  "green_h_min": 30,
+  "green_h_max": 95,
+  "green_s_min": 36,
+  "green_s_max": 255,
+  "green_v_min": 128,
   "green_v_max": 255,
-  "min_green_contour_area": 2230,
+  "min_green_contour_area": 2035,
   "morph_open_size": 3,
   "morph_close_size": 7,
-  "saved_at": "2026-10-26T16:18:17"
+  "saved_at": "2026-10-29T13:17:12"
 }

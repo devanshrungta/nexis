@@ -13,7 +13,6 @@ IMPORTANT:
 import os
 import time
 import math
-import json
 from collections import deque
 from datetime import datetime
 
@@ -30,6 +29,20 @@ except ImportError:
 from position_map import PositionMap, PositionMapError
 
 
+# Resolve calibration resources relative to THIS script, not the terminal's
+# current working directory. The controller module otherwise uses relative
+# paths and can silently load a different position_map.json/servo_calibration.json.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CALIBRATION_PATH = os.path.join(SCRIPT_DIR, "servo_calibration.json")
+POSITION_MAP_PATH = os.path.join(SCRIPT_DIR, "position_map.json")
+
+# Conservative motion profile from the pre-README controller version. The
+# actuator has no encoder; high rate/acceleration can cause missed physical
+# steps while the software counter still assumes each commanded pulse moved it.
+TRACKER_ACTUATOR_MAX_SPEED_STEPS_S = 2500
+TRACKER_ACTUATOR_ACCELERATION_STEPS_S2 = 1250
+
+
 # --------------------------- CAMERA ----------------------------------------
 CAMERA_DEVICE = 0
 FRAME_WIDTH = 1280
@@ -38,28 +51,29 @@ FRAME_FPS = 30
 
 # ------------------------ GREEN SEGMENTATION -------------------------------
 # OpenCV HSV hue is 0..179. Tune these values for the dummy weed and lighting.
-GREEN_H_MIN = 27
-GREEN_H_MAX = 74
-GREEN_S_MIN = 39
-GREEN_S_MAX = 254
-GREEN_V_MIN = 88
+GREEN_H_MIN = 30
+GREEN_H_MAX = 95
+GREEN_S_MIN = 36
+GREEN_S_MAX = 255
+GREEN_V_MIN = 128
 GREEN_V_MAX = 255
 MIN_GREEN_CONTOUR_AREA = 2000       # pixels; reduce if the weed is small
 MORPH_OPEN_SIZE = 3
-MORPH_CLOSE_SIZE = 10
+MORPH_CLOSE_SIZE = 7
 BBOX_SMOOTH_ALPHA = 0.65           # higher follows motion faster
 MAX_TRACK_JUMP_PX = 240            # association gate for a moving target
-# Temporal tracking / candidate merging. Tune these after watching the overlays.
-MERGE_IOU_THRESHOLD = 0.30         # merge boxes if IoU >= this value
-MERGE_GAP_PX = 10                  # also merge boxes whose edge gap is <= this many pixels
+# Temporal tracking / box grouping.
+MERGE_IOU_THRESHOLD = 0.30         # group substantially overlapping leaf/fragment boxes
+MERGE_GAP_PX = 10                   # also group contour boxes separated by a very small gap
 CONFIRM_SECONDS = 0.50             # candidate must persist this long before it can drive motion
-MIN_HIT_RATIO = 0.70               # fraction of recent frames with a detection
+MIN_HIT_RATIO = 0.50               # tolerate brief per-frame segmentation gaps before confirmation
 HISTORY_FRAMES = 20                # hit-ratio window (20 frames at 30 FPS ~= 0.67 s)
 MIN_CONFIRM_HITS = 8               # minimum detections in history before confirmation
-MAX_MISSED_SECONDS = 0.30          # retain track identity through brief gaps, but never drive on a missing frame
+MAX_MISSED_SECONDS = 0.30          # only predict/drive through a very brief detection gap
+TRACK_RETENTION_SECONDS = 1.00    # retain confirmed identity longer, but stop motion after MAX_MISSED_SECONDS
 TRACK_MATCH_DISTANCE_PX = 80       # maximum centroid distance for matching detections to tracks
 TRACK_MATCH_IOU_MIN = 0.01         # matching can also happen by IoU, even at low centroid movement
-DETECTION_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "green_weed_detection_settings.json")
+# Detection thresholds below are intentionally hard-coded; no JSON settings are loaded.
 
 # ----------------------- MOTION / ENGAGEMENT -------------------------------
 SERVO_CENTER_ID = 2056
@@ -75,12 +89,12 @@ ACTUATOR_ALIGNMENT_TOLERANCE_STEPS = 60
 ACTUATOR_MAX_SPEED_FOR_ENGAGEMENT = 75
 SERVO_SETTLE_TOLERANCE_ID = 8
 SERVO_COMMAND_DEADBAND_ID = 4
-TARGET_POINT_SMOOTH_ALPHA = 0.25
+TARGET_POINT_SMOOTH_ALPHA = 0.25   # restored pre-README target-point smoothing
 TARGET_STABLE_WINDOW_S = 0.20
 TARGET_STABLE_DISTANCE_PX = 12
 APPROACH_MAX_SECONDS = 1.50
 SIMULATED_SHOOT_DWELL_S = 0.15
-JITTER_DURATION_S = 0.45
+JITTER_DURATION_S = 5
 NEXT_TARGET_PAUSE_S = 0.05
 
 # ----------------------- RECORDING / UI -----------------------------------
@@ -90,32 +104,11 @@ WINDOW_NAME = "Moving Green Weed Tracker (annotated recording)"
 
 
 def load_detection_settings():
-    """Load values saved by green_weed_detection_tuner.py, if present."""
-    global GREEN_H_MIN, GREEN_H_MAX, GREEN_S_MIN, GREEN_S_MAX
-    global GREEN_V_MIN, GREEN_V_MAX, MIN_GREEN_CONTOUR_AREA
-    global MORPH_OPEN_SIZE, MORPH_CLOSE_SIZE
-    path = DETECTION_SETTINGS_FILE
-    if not os.path.isfile(path):
-        print(f"[DETECTION] No {path}; using values defined in this script.")
-        return
-    try:
-        cfg = json.loads(open(path, "r", encoding="utf-8").read())
-        mapping = {
-            "green_h_min": "GREEN_H_MIN", "green_h_max": "GREEN_H_MAX",
-            "green_s_min": "GREEN_S_MIN", "green_s_max": "GREEN_S_MAX",
-            "green_v_min": "GREEN_V_MIN", "green_v_max": "GREEN_V_MAX",
-            "min_green_contour_area": "MIN_GREEN_CONTOUR_AREA",
-            "morph_open_size": "MORPH_OPEN_SIZE", "morph_close_size": "MORPH_CLOSE_SIZE",
-        }
-        for key, variable in mapping.items():
-            if key in cfg:
-                globals()[variable] = int(cfg[key])
-        print("[DETECTION] Loaded tuned HSV/contour values from", os.path.abspath(path))
-        print(f"[DETECTION] HSV H={GREEN_H_MIN}-{GREEN_H_MAX}, S={GREEN_S_MIN}-{GREEN_S_MAX}, "
-              f"V={GREEN_V_MIN}-{GREEN_V_MAX}; min area={MIN_GREEN_CONTOUR_AREA}; "
-              f"open={MORPH_OPEN_SIZE}; close={MORPH_CLOSE_SIZE}")
-    except Exception as exc:
-        print(f"[DETECTION] Could not load {path}: {exc}. Using script defaults.")
+    """Report the hard-coded detector values; intentionally do not load JSON."""
+    print("[DETECTION] Using ONLY the hard-coded values in this script; tuner and JSON files are untouched/ignored.")
+    print(f"[DETECTION] HSV H={GREEN_H_MIN}-{GREEN_H_MAX}, S={GREEN_S_MIN}-{GREEN_S_MAX}, "
+          f"V={GREEN_V_MIN}-{GREEN_V_MAX}; min area={MIN_GREEN_CONTOUR_AREA}; "
+          f"open={MORPH_OPEN_SIZE}; close={MORPH_CLOSE_SIZE}")
 
 
 def bbox_iou(a, b):
@@ -129,7 +122,7 @@ def bbox_iou(a, b):
 
 
 def bbox_gap(a, b):
-    """Euclidean distance between rectangle edges; zero if they overlap."""
+    """Euclidean distance between rectangle edges; zero when they overlap."""
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
     dx = max(0.0, bx - (ax + aw), ax - (bx + bw))
@@ -138,21 +131,19 @@ def bbox_gap(a, b):
 
 
 def merge_boxes(boxes):
-    """Repeatedly merge overlapping/nearby boxes until no pair qualifies."""
+    """Group overlapping or immediately adjacent boxes belonging to the same weed."""
     merged = [tuple(map(float, b)) for b in boxes]
     changed = True
     while changed:
         changed = False
-        out = []
+        result = []
         while merged:
             current = merged.pop(0)
             i = 0
             while i < len(merged):
                 other = merged[i]
-                # Match the intended rule: merge boxes only when their overlap is
-                # substantial. A small edge gap is not sufficient; chained gap-merges
-                # can combine unrelated green regions across the image.
-                if bbox_iou(current, other) >= MERGE_IOU_THRESHOLD:
+                if (bbox_iou(current, other) >= MERGE_IOU_THRESHOLD or
+                        bbox_gap(current, other) <= MERGE_GAP_PX):
                     x1 = min(current[0], other[0])
                     y1 = min(current[1], other[1])
                     x2 = max(current[0] + current[2], other[0] + other[2])
@@ -160,21 +151,22 @@ def merge_boxes(boxes):
                     current = (x1, y1, x2 - x1, y2 - y1)
                     merged.pop(i)
                     changed = True
-                    # Restart comparisons because the expanded box may now touch another.
+                    # Re-check after expansion so all adjacent fragments are included.
                     i = 0
                 else:
                     i += 1
-            out.append(current)
-        merged = out
+            result.append(current)
+        merged = result
     return merged
 
 
 class GreenTargetTracker:
-    """Merge green fragments and confirm candidates using persistence over frames."""
+    """Track green weeds while grouping overlapping leaf/fragment boxes."""
     def __init__(self):
         self.tracks = {}
         self.next_track_id = 1
         self.debug_tracks = []
+        self.raw_detections = []
         self.frame_index = 0
         self.max_missed_frames = max(1, int(round(MAX_MISSED_SECONDS * FRAME_FPS)))
         open_size = self._odd_kernel(MORPH_OPEN_SIZE)
@@ -207,47 +199,58 @@ class GreenTargetTracker:
         return b[0] + b[2] / 2.0, b[1] + b[3] / 2.0
 
     def update(self, mask):
+        '''Track accepted contours using the earlier, box-center target logic.'''
         self.frame_index += 1
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        raw = []
+        contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates = []
         for contour in contours:
             area = float(cv2.contourArea(contour))
             if area < MIN_GREEN_CONTOUR_AREA:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
             if w >= 3 and h >= 3:
-                raw.append((float(x), float(y), float(w), float(h)))
+                candidates.append({
+                    "bbox": (float(x), float(y), float(w), float(h)),
+                    "area": area,
+                })
 
-        boxes = merge_boxes(raw)
-        # Candidate-to-track matching: prioritize higher IoU, then shorter centroid distance.
+        # Pre-README logic: merge overlapping/near-touching boxes and use the center
+        # of the merged, smoothed bounding box—not the green-pixel centroid.
+        self.raw_detections = candidates
+        boxes = merge_boxes([candidate["bbox"] for candidate in candidates])
+
+        # Match by direct overlap and centroid distance. Do not use velocity to project
+        # a different target center when the visible leaf outline shifts.
         pairs = []
         for tid, track in self.tracks.items():
             old = track["bbox"]
-            ocx, ocy = self._center(old)
+            old_cx, old_cy = self._center(old)
             for bi, box in enumerate(boxes):
                 cx, cy = self._center(box)
-                dist = math.hypot(cx - ocx, cy - ocy)
+                dist = math.hypot(cx - old_cx, cy - old_cy)
                 iou = bbox_iou(old, box)
                 if (dist <= TRACK_MATCH_DISTANCE_PX or
                         (iou >= TRACK_MATCH_IOU_MIN and dist <= 1.5 * TRACK_MATCH_DISTANCE_PX)):
                     score = (1.0 - iou) + dist / max(1.0, TRACK_MATCH_DISTANCE_PX)
-                    pairs.append((score, tid, bi, dist, iou))
+                    pairs.append((score, tid, bi))
         pairs.sort(key=lambda item: item[0])
+
         used_tracks, used_boxes = set(), set()
         matches = {}
-        for _, tid, bi, _, _ in pairs:
+        for _, tid, bi in pairs:
             if tid not in used_tracks and bi not in used_boxes:
                 used_tracks.add(tid)
                 used_boxes.add(bi)
                 matches[tid] = bi
 
-        # Update matched tracks; missing tracks receive a zero in their hit history.
+        # Keep the original box smoothing (alpha 0.65). The main loop then applies
+        # the original point smoothing (alpha 0.25) to the resulting box center.
         for tid, track in list(self.tracks.items()):
             if tid in matches:
                 box = boxes[matches[tid]]
-                old = track["bbox"]
+                old_box = track["bbox"]
                 a = BBOX_SMOOTH_ALPHA
-                track["bbox"] = tuple(a * box[i] + (1.0 - a) * old[i] for i in range(4))
+                track["bbox"] = tuple(a * box[i] + (1.0 - a) * old_box[i] for i in range(4))
                 track["last_seen"] = time.monotonic()
                 track["misses"] = 0
                 track["hits"] += 1
@@ -259,7 +262,7 @@ class GreenTargetTracker:
                 track["history"].append(0)
                 track["matched"] = False
 
-        # Start a tentative track for every unmatched merged candidate.
+        # Start a tentative track for each unmatched merged box.
         for bi, box in enumerate(boxes):
             if bi in used_boxes:
                 continue
@@ -267,39 +270,69 @@ class GreenTargetTracker:
             self.next_track_id += 1
             now = time.monotonic()
             self.tracks[tid] = {
-                "bbox": box, "first_seen": now, "last_seen": now, "misses": 0,
-                "hits": 1, "history": deque([1], maxlen=HISTORY_FRAMES),
-                "matched": True, "area": box[2] * box[3],
+                "bbox": box,
+                "first_seen": now,
+                "last_seen": now,
+                "misses": 0,
+                "hits": 1,
+                "history": deque([1], maxlen=HISTORY_FRAMES),
+                "matched": True,
+                "area": box[2] * box[3],
+                "confirmed": False,
             }
 
-        # Remove tracks only after the grace period, preserving identity across short gaps.
+        # Use elapsed time for retention, but keep confirmation latched to avoid
+        # reverting a stable track to tentative due to a brief segmentation gap.
+        now = time.monotonic()
         for tid in list(self.tracks):
-            if self.tracks[tid]["misses"] > self.max_missed_frames:
+            if now - self.tracks[tid]["last_seen"] > TRACK_RETENTION_SECONDS:
                 del self.tracks[tid]
 
-        now = time.monotonic()
         self.debug_tracks = []
         confirmed = []
         for tid, track in self.tracks.items():
             age = now - track["first_seen"]
             history = track["history"]
             hit_ratio = sum(history) / max(1, len(history))
-            is_confirmed = (age >= CONFIRM_SECONDS and track["hits"] >= MIN_CONFIRM_HITS
-                            and len(history) >= MIN_CONFIRM_HITS and hit_ratio >= MIN_HIT_RATIO)
-            status = "LOST" if not track["matched"] else ("CONFIRMED" if is_confirmed else "TENTATIVE")
+            meets_confirmation = (
+                age >= CONFIRM_SECONDS
+                and track["hits"] >= MIN_CONFIRM_HITS
+                and len(history) >= MIN_CONFIRM_HITS
+                and hit_ratio >= MIN_HIT_RATIO
+            )
+            if meets_confirmation:
+                track["confirmed"] = True
+            is_confirmed = bool(track.get("confirmed", False))
             b = tuple(int(round(v)) for v in track["bbox"])
+            if track["matched"]:
+                status = "CONFIRMED" if is_confirmed else "TENTATIVE"
+            else:
+                gap_s = now - track["last_seen"]
+                if is_confirmed and gap_s <= MAX_MISSED_SECONDS:
+                    status = "CONFIRMED-HOLD"
+                elif is_confirmed and gap_s <= TRACK_RETENTION_SECONDS:
+                    status = "CONFIRMED-RECOVERY"
+                else:
+                    status = "LOST"
             self.debug_tracks.append({
-                "id": tid, "bbox": b, "age": age, "hit_ratio": hit_ratio,
-                "status": status, "matched": track["matched"], "area": track["area"],
-                "hits": track["hits"], "misses": track["misses"],
+                "id": tid,
+                "bbox": b,
+                # Hold the last measured box through a short gap; do not extrapolate it.
+                "predicted_bbox": b,
+                "age": age,
+                "hit_ratio": hit_ratio,
+                "status": status,
+                "matched": track["matched"],
+                "confirmed": is_confirmed,
+                "area": track["area"],
+                "hits": track["hits"],
+                "misses": track["misses"],
             })
-            # A confirmed track can drive control only when detected in THIS frame.
             if is_confirmed and track["matched"]:
                 confirmed.append((track["area"], age, tid, b))
 
         if not confirmed:
             return None
-        # For the dummy-weed test, prioritize the largest confirmed green target.
         _, _, tid, bbox = max(confirmed, key=lambda item: (item[0], item[1]))
         x, y, w, h = bbox
         midpoint = (int(round(x + w / 2)), int(round(y + h / 2)))
@@ -417,16 +450,40 @@ def main():
             hw._jitter_base = safe_base
             hw._jitter_start = time.monotonic()
             hw._jitter_active = True
+        print(f"[JITTER] Enabled: base={safe_base}, amplitude=+/-{amplitude} IDs, "
+              f"requested frequency={JITTER_FREQUENCY_HZ:.1f} Hz, duration={JITTER_DURATION_S:.1f} s")
         return safe_base
 
     def stop_jitter():
         with hw._jitter_lock:
+            was_active = hw._jitter_active
             hw._jitter_active = False
             hw._jitter_start = None
             hw._jitter_base = None
+        if was_active:
+            print("[JITTER] Stop requested.")
 
     try:
         load_detection_settings()
+
+        # Pin both files to the package directory. This avoids using a stale map
+        # or travel calibration based on whichever folder launched Python.
+        hw.CALIBRATION_FILE = CALIBRATION_PATH
+        hw.POSITION_MAP_FILE = POSITION_MAP_PATH
+
+        # Restore the conservative actuator speed/acceleration used in the older
+        # controller version. Position is open-loop estimated, so don't trade
+        # possible missed steps for speed while verifying aiming accuracy.
+        if hasattr(hw, "ACT_MAX_SPEED_STEPS_S"):
+            hw.ACT_MAX_SPEED_STEPS_S = TRACKER_ACTUATOR_MAX_SPEED_STEPS_S
+        if hasattr(hw, "ACT_ACCELERATION_STEPS_S2"):
+            hw.ACT_ACCELERATION_STEPS_S2 = TRACKER_ACTUATOR_ACCELERATION_STEPS_S2
+        print(f"[FILES] Travel calibration: {CALIBRATION_PATH}")
+        print(f"[FILES] Position map: {POSITION_MAP_PATH}")
+        print(f"[ACTUATOR PROFILE] max speed={hw.ACT_MAX_SPEED_STEPS_S} steps/s; "
+              f"acceleration={hw.ACT_ACCELERATION_STEPS_S2} steps/s^2 "
+              "(conservative accuracy-test profile)")
+
         hw.load_calibration()
         # Override the controller's older visible limits with the user's current calibrated limits.
         hw.ST_VISIBLE_MIN_POSITION = SERVO_WINDOW_MIN_ID
@@ -440,9 +497,24 @@ def main():
         except Exception as exc:
             print(f"[ST3215] WARNING: could not set speed/acceleration ({type(exc).__name__}: {exc}); "
                   "continuing with servo's stored settings.")
-        position_map = PositionMap.load(hw.POSITION_MAP_FILE)
-        print(f"[MAP] {position_map.map_type}; {position_map.camera_width}x{position_map.camera_height}; "
-              f"{len(position_map.samples)} samples")
+        position_map = PositionMap.load(POSITION_MAP_PATH)
+        sample_x = [float(p["x"]) for p in position_map.samples]
+        sample_y = [float(p["y"]) for p in position_map.samples]
+        sample_a = [float(p["actuator"]) for p in position_map.samples]
+        sample_s = [float(p["servo"]) for p in position_map.samples]
+        print(f"[MAP] Loaded {position_map.map_type}; {position_map.camera_width}x{position_map.camera_height}; "
+              f"{len(position_map.samples)} samples from {POSITION_MAP_PATH}")
+        print(f"[MAP COVERAGE] pixel x={min(sample_x):.0f}..{max(sample_x):.0f}, "
+              f"y={min(sample_y):.0f}..{max(sample_y):.0f}; "
+              f"servo samples={min(sample_s):.0f}..{max(sample_s):.0f}; "
+              f"actuator samples={min(sample_a):.0f}..{max(sample_a):.0f} steps")
+        if (min(sample_a) < float(hw.ACTUATOR_MIN_POSITION) - 1.0 or
+                max(sample_a) > float(hw.ACTUATOR_MAX_POSITION) + 1.0):
+            raise RuntimeError(
+                f"Position map actuator samples span {min(sample_a):.0f}..{max(sample_a):.0f} steps, "
+                f"but the loaded travel is {hw.ACTUATOR_MIN_POSITION}..{hw.ACTUATOR_MAX_POSITION}. "
+                "The map and actuator calibration do not match; motion is stopped for safety."
+            )
         print(f"[SERVO] Safe IDs {SERVO_WINDOW_MIN_ID}..{SERVO_WINDOW_MAX_ID}; center={SERVO_CENTER_ID}")
 
         if hw.ACTUATOR_MAX_POSITION > 0:
@@ -473,11 +545,17 @@ def main():
                                f"but configured camera is {FRAME_WIDTH}x{FRAME_HEIGHT}.")
         camera = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
         if not camera.isOpened():
-            raise RuntimeError(f"Could not open camera /dev/video{CAMERA_DEVICE}")
+            camera.release()
+            camera = cv2.VideoCapture(CAMERA_DEVICE)
+        if not camera.isOpened():
+            raise RuntimeError(f"Could not open camera device {CAMERA_DEVICE}")
+        # Match the tuner: request resolution only. Do not force FPS/MJPG here,
+        # because that can change the camera stream used by HSV segmentation.
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        camera.set(cv2.CAP_PROP_FPS, FRAME_FPS)
-        camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        print(f"[CAMERA] Requested {FRAME_WIDTH}x{FRAME_HEIGHT}; actual "
+              f"{int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))}; "
+              f"reported FPS={camera.get(cv2.CAP_PROP_FPS):.1f}")
 
         os.makedirs(RECORD_DIR, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -490,7 +568,8 @@ def main():
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
         print("[UI] R recording toggle | C stop motion | T resume | Q quit")
-        print("[TRACK METRICS] hit=percent of recent history frames with a detection; miss=consecutive frames currently missed.")
+        print("[TRACK METRICS] hit=recent detection percentage; miss=consecutive missed frames.")
+        print(f"[TRACK STABILITY] predict/control gap={MAX_MISSED_SECONDS:.2f}s; confirmed ID retention={TRACK_RETENTION_SECONDS:.2f}s. Motion stops after the short control grace, but the confirmed ID is kept for reacquisition.")
         print("[BOX COLORS] GREEN=locked, BLUE/CYAN=confirmed candidate, YELLOW=tentative, RED=DONE/processed track.")
         print("[FLOW] IDENTIFY -> LOCK -> ACTUATE -> SETTLE -> SIMULATED_SHOOT -> JITTER -> NEXT")
 
@@ -531,16 +610,33 @@ def main():
             rejected_track_ids.intersection_update(live_ids)
 
             selected = None
+            selected_is_predicted = False
             if locked_track_id is None and state == "NEXT" and now - state_started >= NEXT_TARGET_PAUSE_S:
                 change_state("IDENTIFY", "Searching for next unprocessed target")
             if locked_track_id is not None:
                 item = debug_by_id.get(locked_track_id)
-                if item and item["matched"] and item["status"] == "CONFIRMED":
+                if item and item.get("confirmed") and item["matched"]:
+                    # Refresh the real observation timestamp only when the camera has
+                    # actually detected this target in the current frame.
                     locked_last_seen_time = now
                     x, y, w, h = item["bbox"]
                     selected = ((x, y, w, h), (int(x + w / 2), int(y + h / 2)), locked_track_id)
-                elif locked_last_seen_time is not None and now - locked_last_seen_time > MAX_MISSED_SECONDS:
-                    print(f"[LOCK] Track {locked_track_id} lost; releasing target.")
+                elif (item and item.get("confirmed") and locked_last_seen_time is not None
+                      and now - locked_last_seen_time <= MAX_MISSED_SECONDS):
+                    # Keep the same confirmed ID selected through a brief segmentation
+                    # gap. The last measured box center is held through a brief gap (no velocity prediction).
+                    x, y, w, h = item.get("predicted_bbox", item["bbox"])
+                    selected = ((x, y, w, h), (int(round(x + w / 2)), int(round(y + h / 2))), locked_track_id)
+                    selected_is_predicted = True
+                elif (locked_last_seen_time is not None
+                      and now - locked_last_seen_time <= TRACK_RETENTION_SECONDS):
+                    # Keep the confirmed ID available for reacquisition, but selected
+                    # remains None after the short control grace expires. The fail-safe
+                    # below stops actuator motion and jitter until a real detection returns.
+                    pass
+                elif locked_last_seen_time is not None and now - locked_last_seen_time > TRACK_RETENTION_SECONDS:
+                    gap_s = now - locked_last_seen_time
+                    print(f"[LOCK] Track {locked_track_id} lost; releasing after {gap_s:.2f}s without a detection.")
                     stop_jitter()
                     if actuator_ready:
                         hw.set_actuator_speed(0.0)
@@ -590,6 +686,9 @@ def main():
 
             # Keep visual diagnosis of all candidates, but select only the locked target.
             output = frame.copy()
+            for candidate in tracker.raw_detections:
+                x, y, w, h = (int(round(v)) for v in candidate["bbox"])
+                cv2.rectangle(output, (x, y), (x + w, y + h), (185, 185, 185), 1)
             for item in tracker.debug_tracks:
                 x, y, w, h = item["bbox"]
                 is_locked = item["id"] == locked_track_id
@@ -629,8 +728,14 @@ def main():
 
                 x, y, w, h = bbox
                 cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.circle(output, target_point, 5, (0, 0, 255), -1)
-                cv2.drawMarker(output, target_point, (255, 255, 0), cv2.MARKER_CROSS, 18, 2)
+                # Mark the exact image pixel passed to position_map.pixel_to_position().
+                # This changes only the viewport annotation; target and motion logic stay unchanged.
+                cross_size = 12
+                cx, cy = target_point
+                cv2.drawMarker(
+                    output, (cx, cy), (0, 255, 255), cv2.MARKER_CROSS,
+                    markerSize=cross_size * 2, thickness=2, line_type=cv2.LINE_AA
+                )
 
                 try:
                     mapped_servo, mapped_actuator, map_status = position_map.pixel_to_position(*target_point)
@@ -654,7 +759,11 @@ def main():
                     # Always follow the mapped actuator line while the weed is tracked, even when
                     # the servo target is outside its safe range. Only command the servo inside range.
                     if last_commanded_actuator is None or abs(mapped_actuator - last_commanded_actuator) >= ACTUATOR_RETARGET_DELTA_STEPS:
+                        previous_target = last_commanded_actuator
                         last_commanded_actuator = hw.set_actuator_position_target(mapped_actuator)
+                        print(f"[ACTUATOR] Target={last_commanded_actuator:.1f} steps; "
+                              f"estimated position={hw.get_actuator_position():.1f}; "
+                              f"pixel={target_point}; previous target={previous_target}")
                     if servo_in_window:
                         command_servo(mapped_servo)
                     elif state == "LOCK":
@@ -741,13 +850,27 @@ def main():
                         change_state("NEXT", "Target cycle complete")
 
 
-            # Fail closed on tracking pause or loss; no stale target continues motion.
-            if not tracking_enabled or selected is None:
-                # Never keep jitter or a stale motion target running without a current locked detection.
+            # Stop immediately when the operator pauses. For a brief vision gap on an
+            # already locked target, preserve the current absolute actuator target and
+            # active jitter until the existing lost-target grace period expires. Calling
+            # set_actuator_speed(0) on every missed frame would clear position mode and
+            # repeatedly interrupt motion; it also killed jitter during ordinary gaps.
+            if not tracking_enabled:
                 stop_jitter()
                 if actuator_ready:
                     hw.set_actuator_speed(0.0)
                 last_commanded_actuator = None
+            elif selected is None:
+                in_lost_target_grace = (
+                    locked_track_id is not None
+                    and locked_last_seen_time is not None
+                    and now - locked_last_seen_time <= MAX_MISSED_SECONDS
+                )
+                if not in_lost_target_grace:
+                    stop_jitter()
+                    if actuator_ready:
+                        hw.set_actuator_speed(0.0)
+                    last_commanded_actuator = None
 
             if not actuator_ready:
                 status = "ACTUATOR UNREFERENCED - MOTION DISABLED"
@@ -756,14 +879,34 @@ def main():
                 status = "PAUSED - MOTION STOPPED"
                 status_color = (0, 165, 255)
             elif selected is None:
-                status = f"{state}: NO LOCKED TARGET"
-                status_color = (0, 0, 255)
+                gap_s = (now - locked_last_seen_time) if locked_last_seen_time is not None else float("inf")
+                if locked_track_id is not None and gap_s <= TRACK_RETENTION_SECONDS:
+                    status = f"{state}: WAITING FOR TRACK {locked_track_id} TO REAPPEAR; MOTION STOPPED"
+                    status_color = (0, 165, 255)
+                else:
+                    status = f"{state}: NO LOCKED TARGET"
+                    status_color = (0, 0, 255)
             else:
-                status = f"{state}: {state_note}"
-                status_color = (0, 255, 0) if state in ("SIMULATED_SHOOT", "JITTER", "NEXT") else (0, 165, 255)
+                if selected_is_predicted:
+                    status = f"{state}: HOLDING TRACK {locked_track_id} THROUGH BRIEF GAP"
+                    status_color = (0, 165, 255)
+                else:
+                    status = f"{state}: {state_note}"
+                    status_color = (0, 255, 0) if state in ("SIMULATED_SHOOT", "JITTER", "NEXT") else (0, 165, 255)
 
             cv2.putText(output, status[:62], (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.60, status_color, 2, cv2.LINE_AA)
-            cv2.putText(output, f"{fps:.1f} FPS | {state} | ID {locked_track_id}", (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(output, f"{fps:.1f} FPS | raw contours {len(tracker.raw_detections)} | {state} | ID {locked_track_id}", (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
+            if target_point is not None:
+                est_count = float(hw.get_actuator_position()) if actuator_ready else float("nan")
+                servo_text = f"{mapped_servo:.1f}" if mapped_servo is not None else "--"
+                actuator_text = f"{mapped_actuator:.0f}" if mapped_actuator is not None else "--"
+                est_text = f"{est_count:.0f}" if math.isfinite(est_count) else "--"
+                aim_line = (f"AIM PIXEL {target_point} | MAP {map_status} | "
+                            f"SERVO {servo_text} | ACT TARGET {actuator_text} | "
+                            f"ACT COUNT {est_text} (open-loop)")
+            else:
+                aim_line = f"AIM PIXEL -- | MAP {map_status}"
+            cv2.putText(output, aim_line[:145], (20, 91), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(output, f"REC {'ON' if recording else 'OFF'} | R record | C stop | T resume | Q quit", (20, FRAME_HEIGHT - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 255) if recording else (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(output, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), (FRAME_WIDTH - 245, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 

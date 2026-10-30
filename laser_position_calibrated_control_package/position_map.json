@@ -8,523 +8,289 @@
       "id": 1,
       "placement": 1,
       "corner": "1",
-      "x": 216.0,
-      "y": 590.0,
-      "servo": 1929.0,
-      "actuator": 506.0
+      "x": 342.0,
+      "y": 516.0,
+      "servo": 1931.0,
+      "actuator": 0.0
     },
     {
       "id": 2,
       "placement": 1,
       "corner": "6",
-      "x": 267.0,
-      "y": 593.0,
-      "servo": 1929.0,
-      "actuator": 1272.0
+      "x": 394.0,
+      "y": 520.0,
+      "servo": 1931.0,
+      "actuator": 1345.0
     },
     {
       "id": 3,
       "placement": 1,
       "corner": "30",
-      "x": 345.0,
-      "y": 595.0,
-      "servo": 1929.0,
-      "actuator": 2493.0
+      "x": 462.0,
+      "y": 522.0,
+      "servo": 1931.0,
+      "actuator": 2958.0
     },
     {
       "id": 4,
       "placement": 1,
       "corner": "25",
-      "x": 427.0,
-      "y": 598.0,
-      "servo": 1929.0,
-      "actuator": 3771.0
+      "x": 522.0,
+      "y": 524.0,
+      "servo": 1931.0,
+      "actuator": 4349.0
     },
     {
       "id": 5,
       "placement": 2,
       "corner": "1",
-      "x": 510.0,
-      "y": 599.0,
-      "servo": 1929.0,
-      "actuator": 4989.0
+      "x": 588.0,
+      "y": 523.0,
+      "servo": 1931.0,
+      "actuator": 5773.0
     },
     {
       "id": 6,
       "placement": 2,
       "corner": "6",
-      "x": 600.0,
-      "y": 600.0,
-      "servo": 1929.0,
-      "actuator": 6304.0
+      "x": 662.0,
+      "y": 523.0,
+      "servo": 1931.0,
+      "actuator": 7350.0
     },
     {
       "id": 7,
       "placement": 2,
       "corner": "30",
-      "x": 670.0,
-      "y": 601.0,
-      "servo": 1929.0,
-      "actuator": 7303.0
+      "x": 718.0,
+      "y": 521.0,
+      "servo": 1931.0,
+      "actuator": 8600.0
     },
     {
       "id": 8,
       "placement": 2,
       "corner": "25",
-      "x": 749.0,
-      "y": 597.0,
-      "servo": 1929.0,
-      "actuator": 8445.0
+      "x": 770.0,
+      "y": 519.0,
+      "servo": 1931.0,
+      "actuator": 9769.0
     },
     {
       "id": 9,
       "placement": 3,
       "corner": "1",
-      "x": 833.0,
-      "y": 593.0,
-      "servo": 1929.0,
-      "actuator": 9706.0
+      "x": 822.0,
+      "y": 515.0,
+      "servo": 1931.0,
+      "actuator": 11008.0
     },
     {
       "id": 10,
       "placement": 3,
       "corner": "6",
-      "x": 906.0,
-      "y": 590.0,
-      "servo": 1929.0,
-      "actuator": 10840.0
+      "x": 873.0,
+      "y": 511.0,
+      "servo": 1931.0,
+      "actuator": 12261.0
     },
     {
       "id": 11,
       "placement": 3,
       "corner": "30",
-      "x": 965.0,
-      "y": 586.0,
-      "servo": 1929.0,
-      "actuator": 11840.0
+      "x": 899.0,
+      "y": 510.0,
+      "servo": 1931.0,
+      "actuator": 12954.0
     },
     {
       "id": 12,
       "placement": 3,
       "corner": "25",
-      "x": 1030.0,
-      "y": 579.0,
-      "servo": 1929.0,
+      "x": 906.0,
+      "y": 451.0,
+      "servo": 2033.0,
       "actuator": 12954.0
     },
     {
       "id": 13,
       "placement": 4,
       "corner": "1",
-      "x": 1036.0,
-      "y": 533.0,
-      "servo": 1982.0,
-      "actuator": 12954.0
+      "x": 835.0,
+      "y": 455.0,
+      "servo": 2033.0,
+      "actuator": 11158.0
     },
     {
       "id": 14,
       "placement": 4,
       "corner": "6",
-      "x": 985.0,
-      "y": 536.0,
-      "servo": 1982.0,
-      "actuator": 12064.0
+      "x": 774.0,
+      "y": 458.0,
+      "servo": 2033.0,
+      "actuator": 9750.0
     },
     {
       "id": 15,
       "placement": 4,
       "corner": "30",
-      "x": 909.0,
-      "y": 540.0,
-      "servo": 1982.0,
-      "actuator": 10836.0
+      "x": 721.0,
+      "y": 461.0,
+      "servo": 2033.0,
+      "actuator": 8594.0
     },
     {
       "id": 16,
       "placement": 4,
       "corner": "25",
-      "x": 828.0,
-      "y": 545.0,
-      "servo": 1982.0,
-      "actuator": 9581.0
+      "x": 668.0,
+      "y": 461.0,
+      "servo": 2033.0,
+      "actuator": 7463.0
     },
     {
       "id": 17,
       "placement": 5,
       "corner": "1",
-      "x": 748.0,
-      "y": 547.0,
-      "servo": 1982.0,
-      "actuator": 8407.0
+      "x": 584.0,
+      "y": 463.0,
+      "servo": 2033.0,
+      "actuator": 5682.0
     },
     {
       "id": 18,
       "placement": 5,
       "corner": "6",
-      "x": 680.0,
-      "y": 549.0,
-      "servo": 1983.0,
-      "actuator": 7436.0
+      "x": 514.0,
+      "y": 461.0,
+      "servo": 2033.0,
+      "actuator": 4230.0
     },
     {
       "id": 19,
       "placement": 5,
       "corner": "30",
-      "x": 597.0,
-      "y": 551.0,
-      "servo": 1983.0,
-      "actuator": 6243.0
+      "x": 447.0,
+      "y": 461.0,
+      "servo": 2033.0,
+      "actuator": 2747.0
     },
     {
       "id": 20,
       "placement": 5,
       "corner": "25",
-      "x": 506.0,
-      "y": 549.0,
-      "servo": 1983.0,
-      "actuator": 4952.0
+      "x": 335.0,
+      "y": 459.0,
+      "servo": 2033.0,
+      "actuator": 0.0
     },
     {
       "id": 21,
       "placement": 6,
       "corner": "1",
-      "x": 407.0,
-      "y": 548.0,
-      "servo": 1983.0,
-      "actuator": 3521.0
+      "x": 381.0,
+      "y": 459.0,
+      "servo": 2033.0,
+      "actuator": 1187.0
     },
     {
       "id": 22,
       "placement": 6,
       "corner": "6",
-      "x": 329.0,
-      "y": 548.0,
-      "servo": 1983.0,
-      "actuator": 2328.0
+      "x": 325.0,
+      "y": 376.0,
+      "servo": 2167.0,
+      "actuator": 0.0
     },
     {
       "id": 23,
       "placement": 6,
       "corner": "30",
-      "x": 190.0,
-      "y": 543.0,
-      "servo": 1983.0,
-      "actuator": 0.0
+      "x": 376.0,
+      "y": 375.0,
+      "servo": 2167.0,
+      "actuator": 1240.0
     },
     {
       "id": 24,
       "placement": 6,
       "corner": "25",
-      "x": 271.0,
-      "y": 547.0,
-      "servo": 1983.0,
-      "actuator": 1378.0
+      "x": 443.0,
+      "y": 374.0,
+      "servo": 2167.0,
+      "actuator": 2773.0
     },
     {
       "id": 25,
       "placement": 7,
       "corner": "1",
-      "x": 180.0,
-      "y": 480.0,
-      "servo": 2052.0,
-      "actuator": 0.0
+      "x": 500.0,
+      "y": 374.0,
+      "servo": 2167.0,
+      "actuator": 4005.0
     },
     {
       "id": 26,
       "placement": 7,
       "corner": "6",
-      "x": 267.0,
-      "y": 482.0,
-      "servo": 2052.0,
-      "actuator": 1426.0
+      "x": 555.0,
+      "y": 373.0,
+      "servo": 2167.0,
+      "actuator": 5141.0
     },
     {
       "id": 27,
       "placement": 7,
       "corner": "30",
-      "x": 378.0,
-      "y": 481.0,
-      "servo": 2052.0,
-      "actuator": 3145.0
+      "x": 618.0,
+      "y": 372.0,
+      "servo": 2167.0,
+      "actuator": 6452.0
     },
     {
       "id": 28,
       "placement": 7,
       "corner": "25",
-      "x": 462.0,
-      "y": 482.0,
-      "servo": 2052.0,
-      "actuator": 4360.0
+      "x": 679.0,
+      "y": 371.0,
+      "servo": 2167.0,
+      "actuator": 7687.0
     },
     {
       "id": 29,
       "placement": 8,
       "corner": "1",
-      "x": 537.0,
-      "y": 483.0,
-      "servo": 2052.0,
-      "actuator": 5396.0
+      "x": 736.0,
+      "y": 370.0,
+      "servo": 2167.0,
+      "actuator": 8842.0
     },
     {
       "id": 30,
       "placement": 8,
       "corner": "6",
-      "x": 594.0,
-      "y": 483.0,
-      "servo": 2052.0,
-      "actuator": 6191.0
+      "x": 794.0,
+      "y": 370.0,
+      "servo": 2167.0,
+      "actuator": 10091.0
     },
     {
       "id": 31,
       "placement": 8,
       "corner": "30",
-      "x": 698.0,
-      "y": 481.0,
-      "servo": 2052.0,
-      "actuator": 7679.0
+      "x": 915.0,
+      "y": 368.0,
+      "servo": 2167.0,
+      "actuator": 12954.0
     },
     {
       "id": 32,
       "placement": 8,
       "corner": "25",
-      "x": 786.0,
-      "y": 478.0,
-      "servo": 2052.0,
-      "actuator": 8906.0
-    },
-    {
-      "id": 33,
-      "placement": 9,
-      "corner": "1",
-      "x": 866.0,
-      "y": 477.0,
-      "servo": 2052.0,
-      "actuator": 10061.0
-    },
-    {
-      "id": 34,
-      "placement": 9,
-      "corner": "6",
-      "x": 1043.0,
-      "y": 472.0,
-      "servo": 2052.0,
-      "actuator": 12954.0
-    },
-    {
-      "id": 35,
-      "placement": 9,
-      "corner": "30",
-      "x": 961.0,
-      "y": 472.0,
-      "servo": 2052.0,
-      "actuator": 11565.0
-    },
-    {
-      "id": 36,
-      "placement": 9,
-      "corner": "25",
-      "x": 1044.0,
-      "y": 404.0,
-      "servo": 2123.0,
-      "actuator": 12954.0
-    },
-    {
-      "id": 37,
-      "placement": 10,
-      "corner": "1",
-      "x": 958.0,
-      "y": 405.0,
-      "servo": 2123.0,
-      "actuator": 11488.0
-    },
-    {
-      "id": 38,
-      "placement": 10,
-      "corner": "6",
-      "x": 871.0,
-      "y": 407.0,
-      "servo": 2123.0,
-      "actuator": 10188.0
-    },
-    {
-      "id": 39,
-      "placement": 10,
-      "corner": "30",
-      "x": 788.0,
-      "y": 409.0,
-      "servo": 2123.0,
-      "actuator": 8974.0
-    },
-    {
-      "id": 40,
-      "placement": 10,
-      "corner": "25",
-      "x": 682.0,
-      "y": 410.0,
-      "servo": 2123.0,
-      "actuator": 7501.0
-    },
-    {
-      "id": 41,
-      "placement": 11,
-      "corner": "1",
-      "x": 570.0,
-      "y": 410.0,
-      "servo": 2123.0,
-      "actuator": 5975.0
-    },
-    {
-      "id": 42,
-      "placement": 11,
-      "corner": "6",
-      "x": 475.0,
-      "y": 411.0,
-      "servo": 2123.0,
-      "actuator": 4670.0
-    },
-    {
-      "id": 43,
-      "placement": 11,
-      "corner": "30",
-      "x": 378.0,
-      "y": 411.0,
-      "servo": 2123.0,
-      "actuator": 3288.0
-    },
-    {
-      "id": 44,
-      "placement": 11,
-      "corner": "25",
-      "x": 297.0,
-      "y": 412.0,
-      "servo": 2123.0,
-      "actuator": 2072.0
-    },
-    {
-      "id": 45,
-      "placement": 12,
-      "corner": "1",
-      "x": 219.0,
-      "y": 413.0,
-      "servo": 2123.0,
-      "actuator": 852.0
-    },
-    {
-      "id": 46,
-      "placement": 12,
-      "corner": "6",
-      "x": 173.0,
-      "y": 412.0,
-      "servo": 2123.0,
-      "actuator": 0.0
-    },
-    {
-      "id": 47,
-      "placement": 12,
-      "corner": "30",
-      "x": 169.0,
-      "y": 372.0,
+      "x": 864.0,
+      "y": 369.0,
       "servo": 2167.0,
-      "actuator": 2.0
-    },
-    {
-      "id": 48,
-      "placement": 12,
-      "corner": "25",
-      "x": 232.0,
-      "y": 368.0,
-      "servo": 2167.0,
-      "actuator": 1114.0
-    },
-    {
-      "id": 49,
-      "placement": 13,
-      "corner": "1",
-      "x": 310.0,
-      "y": 367.0,
-      "servo": 2167.0,
-      "actuator": 2334.0
-    },
-    {
-      "id": 50,
-      "placement": 13,
-      "corner": "6",
-      "x": 383.0,
-      "y": 365.0,
-      "servo": 2167.0,
-      "actuator": 3385.0
-    },
-    {
-      "id": 51,
-      "placement": 13,
-      "corner": "30",
-      "x": 488.0,
-      "y": 365.0,
-      "servo": 2167.0,
-      "actuator": 4862.0
-    },
-    {
-      "id": 52,
-      "placement": 13,
-      "corner": "25",
-      "x": 559.0,
-      "y": 364.0,
-      "servo": 2167.0,
-      "actuator": 5825.0
-    },
-    {
-      "id": 53,
-      "placement": 14,
-      "corner": "1",
-      "x": 623.0,
-      "y": 365.0,
-      "servo": 2167.0,
-      "actuator": 6690.0
-    },
-    {
-      "id": 54,
-      "placement": 14,
-      "corner": "6",
-      "x": 705.0,
-      "y": 360.0,
-      "servo": 2167.0,
-      "actuator": 7812.0
-    },
-    {
-      "id": 55,
-      "placement": 14,
-      "corner": "30",
-      "x": 803.0,
-      "y": 361.0,
-      "servo": 2167.0,
-      "actuator": 9154.0
-    },
-    {
-      "id": 56,
-      "placement": 14,
-      "corner": "25",
-      "x": 906.0,
-      "y": 361.0,
-      "servo": 2167.0,
-      "actuator": 10649.0
-    },
-    {
-      "id": 57,
-      "placement": 15,
-      "corner": "1",
-      "x": 1050.0,
-      "y": 359.0,
-      "servo": 2167.0,
-      "actuator": 12954.0
-    },
-    {
-      "id": 58,
-      "placement": 15,
-      "corner": "6",
-      "x": 986.0,
-      "y": 361.0,
-      "servo": 2167.0,
-      "actuator": 11881.0
+      "actuator": 11677.0
     }
   ]
 }

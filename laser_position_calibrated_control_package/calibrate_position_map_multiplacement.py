@@ -31,7 +31,7 @@ from position_map import PositionMap, PositionMapError
 CAMERA_DEVICE = 0
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
-FRAME_FPS = 60
+FRAME_FPS = 30
 
 
 # ============================================================
@@ -359,7 +359,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, FRAME_FPS)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    # cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
     window = "Sparse Multi-Placement Calibration"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
@@ -598,6 +598,19 @@ def main():
                     f"actuator={position_map.model_rmse_actuator:.1f} steps"
                 )
                 print("[CAL] Within sample convex hull: triangle interpolation; outside: quadratic extrapolation.")
+                snapshot_dir = os.path.join(SCRIPT_DIR, "calibration_snapshots")
+                os.makedirs(snapshot_dir, exist_ok=True)
+
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                snapshot_path = os.path.join(
+                    snapshot_dir,
+                    f"position_map_calibration_{timestamp}.png"
+                )
+
+                if cv2.imwrite(snapshot_path, output):
+                    print(f"[CAL] Annotated calibration screenshot saved: {snapshot_path}")
+                else:
+                    print(f"[CAL] WARNING: Could not save screenshot: {snapshot_path}")
                 if len(state["samples"]) < RECOMMENDED_SAMPLES:
                     print("[CAL] WARNING: map saved with fewer than 16 points; wider coverage may be inaccurate.")
                 try:
